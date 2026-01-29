@@ -30,6 +30,8 @@ enum Commands {
     List,
     /// Show the currently active version
     Show,
+    /// Deactivate svm by removing current symlinks
+    Unset,
 }
 
 fn main() -> Result<()> {
@@ -53,7 +55,29 @@ fn main() -> Result<()> {
             } else {
                 println!("No version currently in use. Use 'svm use <version>'.");
             }
+        },
+        Commands::Unset => unset_version(&bin_dir)?,
+    }
+    Ok(())
+}
+
+fn unset_version(bin_dir: &Path) -> Result<()> {
+    let binaries = ["sui", "move-analyzer"];
+    let mut removed = 0;
+
+    for bin in binaries {
+        let bin_path = bin_dir.join(bin);
+        if bin_path.exists() || bin_path.is_symlink() {
+            fs::remove_file(&bin_path)
+                .with_context(|| format!("Failed to remove symlink at {:?}", bin_path))?;
+            removed += 1;
         }
+    }
+
+    if removed > 0 {
+        println!("SVM deactivated. Binaries removed from {:?}", bin_dir);
+    } else {
+        println!("Nothing to unset. SVM is already inactive.");
     }
     Ok(())
 }
