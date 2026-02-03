@@ -1,13 +1,18 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+use colored::*;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 const GITHUB_API: &str = "https://api.github.com/repos/MystenLabs/sui/releases";
 const USER_AGENT: &str = "svm-cli";
+const SVM_BINARIES: &[&str] = &["sui", "move-analyzer"];
 
 #[derive(Parser)]
+#[command(name = "svm")]
+#[command(about = "Sui Version Manager", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -30,11 +35,27 @@ enum Commands {
     List,
     /// Show the currently active version
     Show,
-    /// Deactivate svm by removing current symlinks
+    /// Deactivate svm by removing shims
     Unset,
 }
 
+#[derive(Debug, PartialEq)]
+enum VersionSource {
+    Global,
+    Local(PathBuf),
+}
+
 fn main() -> Result<()> {
+    // 1. Shim Detection
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(program_name) = args.get(0).and_then(|p| Path::new(p).file_name()) {
+        let program_name = program_name.to_string_lossy();
+        if SVM_BINARIES.contains(&program_name.as_ref()) {
+            return run_shim(&program_name, &args[1..]);
+        }
+    }
+
+    // 2. Standard CLI
     let cli = Cli::parse();
     let svm_dir = dirs::home_dir().context("No home dir")?.join(".svm");
     let versions_dir = svm_dir.join("versions");
@@ -48,106 +69,170 @@ fn main() -> Result<()> {
         Commands::Install { version } => install_version(&version, &versions_dir)?,
         Commands::Use { version } => use_version(&version, &versions_dir, &bin_dir)?,
         Commands::Link { name } => link_local(&name, &versions_dir)?,
-        Commands::List => list_local(&versions_dir, &bin_dir)?,
-        Commands::Show => {
-            if let Some(v) = get_current_version(&bin_dir)? {
-                println!("Current version: {}", v);
-            } else {
-                println!("No version currently in use. Use 'svm use <version>'.");
-            }
-        },
-        Commands::Unset => unset_version(&bin_dir)?,
+        Commands::List => list_local(&versions_dir, &svm_dir)?,
+        Commands::Show => show_version(&svm_dir)?,
+        Commands::Unset => unset_version(&bin_dir, &svm_dir)?,
     }
     Ok(())
 }
 
-fn unset_version(bin_dir: &Path) -> Result<()> {
-    let binaries = ["sui", "move-analyzer"];
+fn resolve_version(svm_dir: &Path) -> Result<Option<(String, VersionSource)>> {
+    let mut current_dir = std::env::current_dir().ok();
+    while let Some(dir) = current_dir {
+        let version_file = dir.join(".svm-version");
+        if version_file.exists() {
+            let v = fs::read_to_string(&version_file)?.trim().to_string();
+            return Ok(Some((v, VersionSource::Local(version_file))));
+        }
+        current_dir = dir.parent().map(|p| p.to_path_buf());
+    }
+
+    let global_version_file = svm_dir.join("version");
+    if global_version_file.exists() {
+        let v = fs::read_to_string(global_version_file)?.trim().to_string();
+        Ok(Some((v, VersionSource::Global)))
+    } else {
+        Ok(None)
+    }
+}
+
+fn run_shim(binary_name: &str, args: &[String]) -> Result<()> {
+    let svm_dir = dirs::home_dir().context("No home dir")?.join(".svm");
+    
+    let (version, _) = resolve_version(&svm_dir)?
+        .ok_or_else(|| anyhow!(
+            "{} SVM is not active. Run '{}' or create a {} file.",
+            "error:".red().bold(),
+            "svm use <version>".cyan(),
+            ".svm-version".cyan()
+        ))?;
+
+    let binary_path = svm_dir.join("versions").join(&version).join(binary_name);
+
+    if !binary_path.exists() {
+        return Err(anyhow!(
+            "{} Binary '{}' not found for version '{}'.\n{} Run '{}' to install it.",
+            "error:".red().bold(),
+            binary_name.yellow(),
+            version.cyan(),
+            "help:".blue().bold(),
+            format!("svm install {}", version).cyan()
+        ));
+    }
+
+    let mut child = Command::new(binary_path)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("Failed to spawn command")?;
+
+    let status = child.wait()?;
+
+    if let Some(code) = status.code() {
+        std::process::exit(code);
+    } else {
+        std::process::exit(1);
+    }
+}
+
+fn unset_version(bin_dir: &Path, svm_dir: &Path) -> Result<()> {
     let mut removed = 0;
 
-    for bin in binaries {
+    for bin in SVM_BINARIES {
         let bin_path = bin_dir.join(bin);
         if bin_path.exists() || bin_path.is_symlink() {
             fs::remove_file(&bin_path)
-                .with_context(|| format!("Failed to remove symlink at {:?}", bin_path))?;
+                .with_context(|| format!("Failed to remove shim at {:?}", bin_path))?;
             removed += 1;
         }
     }
 
+    let version_file = svm_dir.join("version");
+    if version_file.exists() {
+        fs::remove_file(&version_file)?;
+        println!("{} Removed global version file.", "✔".green());
+    }
+
     if removed > 0 {
-        println!("SVM deactivated. Binaries removed from {:?}", bin_dir);
+        println!("{} SVM deactivated. Shims removed from {:?}", "✔".green(), bin_dir);
     } else {
-        println!("Nothing to unset. SVM is already inactive.");
+        println!("{} SVM was not active.", "ℹ".blue());
     }
     Ok(())
 }
 
-/// Helper to find which version the symlink is pointing to
-fn get_current_version(bin_dir: &Path) -> Result<Option<String>> {
-    let sui_bin = bin_dir.join("sui");
-    if !sui_bin.exists() {
-        return Ok(None);
-    }
-
-    // read_link returns the path the symlink points to
-    let target = fs::read_link(sui_bin)?;
-    
-    // The target path looks like: /Users/name/.svm/versions/mainnet-v1.24.1/sui
-    // We want the parent folder name (mainnet-v1.24.1)
-    if let Some(parent) = target.parent() {
-        if let Some(name) = parent.file_name() {
-            return Ok(Some(name.to_string_lossy().into_owned()));
+fn show_version(svm_dir: &Path) -> Result<()> {
+    match resolve_version(svm_dir)? {
+        Some((v, source)) => {
+            print!("{} Current version: {}", "➜".cyan(), v.green().bold());
+            match source {
+                VersionSource::Global => println!(" ({})", "global".dimmed()),
+                VersionSource::Local(path) => {
+                    println!("\n  {} set by {}", "↳".dimmed(), path.display().to_string().blue());
+                }
+            }
         }
+        None => println!("{} No version currently in use. Run '{}' to set one.", "ℹ".blue(), "svm use <version>".cyan()),
     }
-    Ok(None)
+    Ok(())
 }
 
 fn list_remote(network_filter: Option<String>) -> Result<()> {
     let client = reqwest::blocking::Client::builder().user_agent(USER_AGENT).build()?;
     let releases: serde_json::Value = client.get(GITHUB_API).send()?.json()?;
 
-    println!("{:<25} | {:<15}", "Tag Name", "Network");
-    println!("{}", "-".repeat(45));
+    println!("\n{:<25} | {:<15}", "Tag Name".bold(), "Network".bold());
+    println!("{}", "-".repeat(45).dimmed());
 
     if let Some(arr) = releases.as_array() {
         for release in arr {
             let tag = release["tag_name"].as_str().unwrap_or("");
-            let network = if tag.contains("mainnet") { "mainnet" }
-                          else if tag.contains("testnet") { "testnet" }
-                          else if tag.contains("devnet") { "devnet" }
-                          else { "other" };
+            let network = if tag.contains("mainnet") { "mainnet".green() }
+                          else if tag.contains("testnet") { "testnet".yellow() }
+                          else if tag.contains("devnet") { "devnet".blue() }
+                          else { "other".dimmed() };
 
             if let Some(ref filter) = network_filter {
-                if network != filter { continue; }
+                if !tag.contains(filter) { continue; }
             }
-            println!("{:<25} | {:<15}", tag, network);
+            println!("{:<25} | {:<15}", tag.cyan(), network);
         }
     }
+    println!("");
     Ok(())
 }
 
 fn install_version(version: &str, versions_dir: &Path) -> Result<()> {
-    // Standardize the version name for the URL
-    // If user provides "v1.63.4", we check if they meant "mainnet-v1.63.4"
-    // For simplicity, we'll assume they provide the full tag or we default to mainnet
-    let full_tag = if version.starts_with('v') { format!("mainnet-{}", version) } else { version.to_string() };
+    let full_tag = if version.starts_with('v') && !version.contains("net") { 
+        format!("mainnet-{}", version) 
+    } else { 
+        version.to_string() 
+    };
     
     let target_dir = versions_dir.join(&full_tag);
     if target_dir.exists() {
-        println!("Version {} already exists.", full_tag);
-        return Ok(());
+        println!("{} Version {} is already installed.", "ℹ".blue(), full_tag.cyan());
+        return Ok(())
     }
 
-    // URL Pattern for macos-x86_64
+    // Hardcoded for now (improvements for multi-platform coming soon)
     let url = format!(
         "https://github.com/MystenLabs/sui/releases/download/{}/sui-{}-macos-x86_64.tgz",
         full_tag, full_tag
     );
 
-    println!("Downloading from: {}", url);
+    println!("{} Downloading {}...", "⬇".blue(), full_tag.cyan());
     let response = reqwest::blocking::get(url)?;
     if !response.status().is_success() {
-        return Err(anyhow!("Release not found. Try 'svm remote-list' to find exact tag."));
+        return Err(anyhow!(
+            "{} Release not found: {}.\n{} Run '{}' to see available versions.", 
+            "error:".red().bold(),
+            full_tag.yellow(),
+            "help:".blue().bold(),
+            "svm remote-list".cyan()
+        ));
     }
 
     let tar_gz = response.bytes()?;
@@ -157,45 +242,43 @@ fn install_version(version: &str, versions_dir: &Path) -> Result<()> {
     fs::create_dir_all(&target_dir)?;
     archive.unpack(&target_dir)?;
 
-    // macOS binaries: clear the quarantine attribute only if it exists
     if cfg!(target_os = "macos") {
-    // We use "|| true" to ensure the command doesn't return an error 
-    // if the attribute is already missing.
-    let _ = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("xattr -d com.apple.quarantine {}/* 2>/dev/null || true", target_dir.display()))
-        .status();
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!("xattr -d com.apple.quarantine {}/* 2>/dev/null || true", target_dir.display()))
+            .status();
     }
 
-    println!("Installed {} to {:?}", full_tag, target_dir);
+    println!("{} Successfully installed {} to {:?}", "✔".green(), full_tag.green().bold(), target_dir);
     Ok(())
 }
 
 fn use_version(version: &str, versions_dir: &Path, bin_dir: &Path) -> Result<()> {
     let version_path = versions_dir.join(version);
     if !version_path.exists() {
-        return Err(anyhow!("Version {} not found. Install it first.", version));
+        return Err(anyhow!(
+            "{} Version {} not found.\n{} Run '{}' first.",
+            "error:".red().bold(),
+            version.yellow(),
+            "help:".blue().bold(),
+            format!("svm install {}", version).cyan()
+        ));
     }
 
-    // Sui releases often put binaries in a subfolder or directly in root
-    // We'll search for 'sui' and 'move-analyzer' within the version_path
-    let binaries = ["sui", "move-analyzer"];
-    for bin in binaries {
-        let bin_src = version_path.join(bin);
-        let bin_dest = bin_dir.join(bin);
+    let current_exe = std::env::current_exe()?;
 
-        if bin_dest.exists() || bin_dest.is_symlink() {
-            fs::remove_file(&bin_dest)?;
+    for bin in SVM_BINARIES {
+        let shim_path = bin_dir.join(bin);
+        if shim_path.exists() || shim_path.is_symlink() {
+            fs::remove_file(&shim_path)?;
         }
-
-        if bin_src.exists() {
-            symlink(&bin_src, &bin_dest)?;
-        } else {
-            println!("Warning: Binary {} not found in version folder.", bin);
-        }
+        symlink(&current_exe, &shim_path)?;
     }
 
-    println!("Active version set to: {}", version);
+    let svm_dir = versions_dir.parent().unwrap();
+    fs::write(svm_dir.join("version"), version)?;
+
+    println!("{} Active version set to: {}", "✨".green(), version.green().bold());
     Ok(())
 }
 
@@ -204,32 +287,49 @@ fn link_local(name: &str, versions_dir: &Path) -> Result<()> {
     fs::create_dir_all(&target_dir)?;
 
     let cwd = std::env::current_dir()?;
-    for bin in ["sui", "move-analyzer"] {
+    let mut linked_any = false;
+    for bin in SVM_BINARIES {
         let local_bin = cwd.join(bin);
         if local_bin.exists() {
             fs::copy(&local_bin, target_dir.join(bin))?;
-            println!("Linked {}...", bin);
+            println!("  {} Linked {}...", "↳".dimmed(), bin.cyan());
+            linked_any = true;
         }
     }
-    println!("Local build linked as '{}'", name);
+
+    if !linked_any {
+        return Err(anyhow!(
+            "{} No Sui binaries found in current directory.\nExpected: {:?}",
+            "error:".red().bold(),
+            SVM_BINARIES
+        ));
+    }
+
+    println!("{} Local build linked as '{}'", "✔".green(), name.green().bold());
     Ok(())
 }
 
-fn list_local(versions_dir: &Path, bin_dir: &Path) -> Result<()> {
-    let current = get_current_version(bin_dir)?;
+fn list_local(versions_dir: &Path, svm_dir: &Path) -> Result<()> {
+    let current = resolve_version(svm_dir)?.map(|(v, _)| v);
 
-    println!("{:<2} {:<25}", "", "Installed Versions");
-    println!("{}", "-".repeat(30));
+    println!("\n{:<2} {:<25}", "", "Installed Versions".bold());
+    println!("{}", "-".repeat(30).dimmed());
 
-    for entry in fs::read_dir(versions_dir)? {
-        let entry = entry?;
+    let mut entries: Vec<_> = fs::read_dir(versions_dir)?
+        .filter_map(|e| e.ok())
+        .collect();
+    
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
         let name = entry.file_name().to_string_lossy().into_owned();
 
         if Some(name.clone()) == current {
-            println!("* {:<25} (active)", name);
+            println!("{} {:<25} {}", "✔".green(), name.green().bold(), "(active)".dimmed());
         } else {
-            println!("  {:<25}", name);
+            println!("  {:<25}", name.dimmed());
         }
     }
+    println!("");
     Ok(())
 }
