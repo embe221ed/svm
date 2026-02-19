@@ -1,10 +1,11 @@
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, CommandFactory};
 use colored::*;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use clap_complete::{generate, shells::Zsh};
 
 const GITHUB_API: &str = "https://api.github.com/repos/MystenLabs/sui/releases";
 const USER_AGENT: &str = "svm-cli";
@@ -37,6 +38,8 @@ enum Commands {
     Show,
     /// Deactivate svm by removing shims
     Unset,
+    /// Generate shell completions
+    Completions { shell: String },
 }
 
 #[derive(Debug, PartialEq)]
@@ -72,6 +75,37 @@ fn main() -> Result<()> {
         Commands::List => list_local(&versions_dir, &svm_dir)?,
         Commands::Show => show_version(&svm_dir)?,
         Commands::Unset => unset_version(&bin_dir, &svm_dir)?,
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let bin_name = "svm";
+
+            match shell.to_lowercase().as_str() {
+                "zsh" => {
+                    let mut buffer = Vec::new();
+                    generate(Zsh, &mut cmd, bin_name, &mut buffer);
+                    let script = String::from_utf8(buffer)?;
+
+                    // 1. Define the custom completion function logic
+                    let custom_func = r#"
+        _svm_versions() {
+            local -a versions
+            versions=($(ls -1 $HOME/.svm/versions 2>/dev/null))
+            _describe 'installed versions' versions
+        }
+        "#;
+
+                    // 2. Inject the function at the top (after the #compdef line)
+                    let mut final_script = script.replace("#compdef svm", &format!("#compdef svm\n{}", custom_func));
+
+                    // 3. Replace the generic _default with our custom function in the 'use' block
+                    // We target the specific pattern clap generated for your 'use' case
+                    final_script = final_script.replace("':version:_default'", "':version:_svm_versions'");
+
+                    println!("{}", final_script);
+                }
+                _ => return Err(anyhow!("Unsupported shell: {}", shell)),
+            }
+        }
     }
     Ok(())
 }
