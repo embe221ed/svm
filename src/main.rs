@@ -3,9 +3,11 @@ use clap::{Parser, Subcommand, CommandFactory};
 use colored::*;
 use std::fs;
 use std::os::unix::fs::symlink;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use clap_complete::{generate, shells::Zsh};
+use indicatif::{ProgressBar, ProgressStyle};
 
 const GITHUB_API: &str = "https://api.github.com/repos/MystenLabs/sui/releases";
 const USER_AGENT: &str = "svm-cli";
@@ -28,6 +30,8 @@ enum Commands {
     },
     /// Install a version (e.g., v1.63.4 or mainnet-v1.63.4)
     Install { version: String },
+    /// Uninstall a version
+    Uninstall { version: String },
     /// Switch to an installed/linked version
     Use { version: String },
     /// Link a local build (e.g., svm link custom-dev)
@@ -70,6 +74,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::RemoteList { network } => list_remote(network)?,
         Commands::Install { version } => install_version(&version, &versions_dir)?,
+        Commands::Uninstall { version } => uninstall_version(&version, &versions_dir)?,
         Commands::Use { version } => use_version(&version, &versions_dir, &bin_dir)?,
         Commands::Link { name } => link_local(&name, &versions_dir)?,
         Commands::List => list_local(&versions_dir, &svm_dir)?,
@@ -154,21 +159,14 @@ fn run_shim(binary_name: &str, args: &[String]) -> Result<()> {
         ));
     }
 
-    let mut child = Command::new(binary_path)
+    let err = Command::new(binary_path)
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .spawn()
-        .context("Failed to spawn command")?;
+        .exec();
 
-    let status = child.wait()?;
-
-    if let Some(code) = status.code() {
-        std::process::exit(code);
-    } else {
-        std::process::exit(1);
-    }
+    Err(anyhow!("Failed to execute binary: {}", err))
 }
 
 fn unset_version(bin_dir: &Path, svm_dir: &Path) -> Result<()> {
@@ -251,14 +249,37 @@ fn install_version(version: &str, versions_dir: &Path) -> Result<()> {
         return Ok(())
     }
 
-    // Hardcoded for now (improvements for multi-platform coming soon)
+    let os_part = match std::env::consts::OS {
+        "macos" => "macos",
+        "linux" => "ubuntu",
+        "windows" => "windows",
+        os => return Err(anyhow!("Unsupported OS: {}", os)),
+    };
+
+    let arch_part = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "arm64",
+        arch => return Err(anyhow!("Unsupported architecture: {}", arch)),
+    };
+    
+    // Windows support is limited as we rely on .tgz and shim execution which might need tweaks
+    if std::env::consts::OS == "windows" {
+         println!("{} Warning: Windows support is experimental.", "⚠".yellow());
+    }
+
+    let asset_name = format!("sui-{}-{}-{}.tgz", full_tag, os_part, arch_part);
     let url = format!(
-        "https://github.com/MystenLabs/sui/releases/download/{}/sui-{}-macos-x86_64.tgz",
-        full_tag, full_tag
+        "https://github.com/MystenLabs/sui/releases/download/{}/{}",
+        full_tag, asset_name
     );
 
     println!("{} Downloading {}...", "⬇".blue(), full_tag.cyan());
-    let response = reqwest::blocking::get(url)?;
+    
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(USER_AGENT)
+        .build()?;
+    let response = client.get(&url).send()?;
+
     if !response.status().is_success() {
         return Err(anyhow!(
             "{} Release not found: {}.\n{} Run '{}' to see available versions.", 
@@ -269,12 +290,21 @@ fn install_version(version: &str, versions_dir: &Path) -> Result<()> {
         ));
     }
 
-    let tar_gz = response.bytes()?;
-    let tar = flate2::read::GzDecoder::new(&tar_gz[..]);
+    let total_size = response.content_length().unwrap_or(0);
+    let pb = ProgressBar::new(total_size);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+        .unwrap()
+        .progress_chars("#>-"));
+
+    let reader = pb.wrap_read(response);
+    let tar = flate2::read::GzDecoder::new(reader);
     let mut archive = tar::Archive::new(tar);
 
     fs::create_dir_all(&target_dir)?;
     archive.unpack(&target_dir)?;
+
+    pb.finish_with_message("Download complete");
 
     if cfg!(target_os = "macos") {
         let _ = Command::new("sh")
@@ -284,6 +314,21 @@ fn install_version(version: &str, versions_dir: &Path) -> Result<()> {
     }
 
     println!("{} Successfully installed {} to {:?}", "✔".green(), full_tag.green().bold(), target_dir);
+    Ok(())
+}
+
+fn uninstall_version(version: &str, versions_dir: &Path) -> Result<()> {
+    let target_dir = versions_dir.join(version);
+    if !target_dir.exists() {
+        return Err(anyhow!(
+            "{} Version {} is not installed.",
+            "error:".red().bold(),
+            version.yellow()
+        ));
+    }
+
+    fs::remove_dir_all(&target_dir)?;
+    println!("{} Successfully uninstalled {}.", "✔".green(), version.red().bold());
     Ok(())
 }
 
