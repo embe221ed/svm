@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, CommandFactory};
 use colored::*;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -27,13 +28,21 @@ enum Commands {
     RemoteList {
         #[arg(short, long)]
         network: Option<String>, // e.g., "mainnet", "testnet"
+        /// Max number of pages to fetch (100 releases per page)
+        #[arg(short = 'p', long, default_value = "3")]
+        pages: u32,
     },
     /// Install a version (e.g., v1.63.4 or mainnet-v1.63.4)
     Install { version: String },
     /// Uninstall a version
     Uninstall { version: String },
     /// Switch to an installed/linked version
-    Use { version: String },
+    Use {
+        version: String,
+        /// Write .svm-version in current directory instead of setting globally
+        #[arg(short, long)]
+        local: bool,
+    },
     /// Link a local build (e.g., svm link custom-dev)
     Link { name: String },
     /// List local versions (active one marked with *)
@@ -72,10 +81,10 @@ fn main() -> Result<()> {
     fs::create_dir_all(&bin_dir)?;
 
     match cli.command {
-        Commands::RemoteList { network } => list_remote(network)?,
-        Commands::Install { version } => install_version(&version, &versions_dir)?,
+        Commands::RemoteList { network, pages } => list_remote(network, &svm_dir, pages)?,
+        Commands::Install { version } => install_version(&version, &versions_dir, &svm_dir)?,
         Commands::Uninstall { version } => uninstall_version(&version, &versions_dir)?,
-        Commands::Use { version } => use_version(&version, &versions_dir, &bin_dir)?,
+        Commands::Use { version, local } => use_version(&version, &versions_dir, &bin_dir, local)?,
         Commands::Link { name } => link_local(&name, &versions_dir)?,
         Commands::List => list_local(&versions_dir, &svm_dir)?,
         Commands::Show => show_version(&svm_dir)?,
@@ -137,7 +146,7 @@ fn resolve_version(svm_dir: &Path) -> Result<Option<(String, VersionSource)>> {
 
 fn run_shim(binary_name: &str, args: &[String]) -> Result<()> {
     let svm_dir = dirs::home_dir().context("No home dir")?.join(".svm");
-    
+
     let (version, _) = resolve_version(&svm_dir)?
         .ok_or_else(|| anyhow!(
             "{} SVM is not active. Run '{}' or create a {} file.",
@@ -211,38 +220,140 @@ fn show_version(svm_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn list_remote(network_filter: Option<String>) -> Result<()> {
-    let client = reqwest::blocking::Client::builder().user_agent(USER_AGENT).build()?;
-    let releases: serde_json::Value = client.get(GITHUB_API).send()?.json()?;
+// --- GitHub API helpers ---
+
+fn build_client() -> Result<reqwest::blocking::Client> {
+    let mut builder = reqwest::blocking::Client::builder().user_agent(USER_AGENT);
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        use reqwest::header;
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_str(&format!("Bearer {}", token))?,
+        );
+        builder = builder.default_headers(headers);
+    }
+    Ok(builder.build()?)
+}
+
+fn cache_dir(svm_dir: &Path) -> Result<PathBuf> {
+    let dir = svm_dir.join("cache");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Fetch releases with ETag-based caching and pagination.
+fn fetch_releases_cached(svm_dir: &Path, max_pages: u32) -> Result<Vec<serde_json::Value>> {
+    let cache = cache_dir(svm_dir)?;
+    let cache_file = cache.join("releases.json");
+    let etag_file = cache.join("releases.etag");
+
+    let client = build_client()?;
+
+    let mut all_releases: Vec<serde_json::Value> = Vec::new();
+
+    for page in 1..=max_pages {
+        let url = format!("{}?per_page=100&page={}", GITHUB_API, page);
+        let mut request = client.get(&url);
+
+        // Use ETag only for the first page to detect staleness
+        if page == 1 {
+            if let Ok(etag) = fs::read_to_string(&etag_file) {
+                request = request.header("If-None-Match", etag.trim());
+            }
+        }
+
+        let response = request.send();
+
+        match response {
+            Ok(resp) => {
+                if page == 1 && resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+                    // Cache is still fresh, use it
+                    if let Ok(cached) = fs::read_to_string(&cache_file) {
+                        if let Ok(parsed) = serde_json::from_str(&cached) {
+                            return Ok(parsed);
+                        }
+                    }
+                }
+
+                if !resp.status().is_success() {
+                    // If first page fails and we have cache, fall back
+                    if page == 1 {
+                        if let Ok(cached) = fs::read_to_string(&cache_file) {
+                            if let Ok(parsed) = serde_json::from_str(&cached) {
+                                eprintln!("{} Using cached release list (API returned {}).", "ℹ".blue(), resp.status());
+                                return Ok(parsed);
+                            }
+                        }
+                    }
+                    return Err(anyhow!("GitHub API error: {}", resp.status()));
+                }
+
+                // Save ETag from first page
+                if page == 1 {
+                    if let Some(etag) = resp.headers().get("etag") {
+                        let _ = fs::write(&etag_file, etag.as_bytes());
+                    }
+                }
+
+                let page_releases: Vec<serde_json::Value> = resp.json()?;
+                let is_last = page_releases.len() < 100;
+                all_releases.extend(page_releases);
+
+                if is_last {
+                    break;
+                }
+            }
+            Err(e) => {
+                // Network error — fall back to cache if available
+                if page == 1 {
+                    if let Ok(cached) = fs::read_to_string(&cache_file) {
+                        if let Ok(parsed) = serde_json::from_str(&cached) {
+                            eprintln!("{} Using cached release list (network error: {}).", "ℹ".blue(), e);
+                            return Ok(parsed);
+                        }
+                    }
+                }
+                return Err(e.into());
+            }
+        }
+    }
+
+    // Update cache
+    let _ = fs::write(&cache_file, serde_json::to_string(&all_releases)?);
+
+    Ok(all_releases)
+}
+
+fn list_remote(network_filter: Option<String>, svm_dir: &Path, max_pages: u32) -> Result<()> {
+    let releases = fetch_releases_cached(svm_dir, max_pages)?;
 
     println!("\n{:<25} | {:<15}", "Tag Name".bold(), "Network".bold());
     println!("{}", "-".repeat(45).dimmed());
 
-    if let Some(arr) = releases.as_array() {
-        for release in arr {
-            let tag = release["tag_name"].as_str().unwrap_or("");
-            let network = if tag.contains("mainnet") { "mainnet".green() }
-                          else if tag.contains("testnet") { "testnet".yellow() }
-                          else if tag.contains("devnet") { "devnet".blue() }
-                          else { "other".dimmed() };
+    for release in &releases {
+        let tag = release["tag_name"].as_str().unwrap_or("");
+        let network = if tag.contains("mainnet") { "mainnet".green() }
+                      else if tag.contains("testnet") { "testnet".yellow() }
+                      else if tag.contains("devnet") { "devnet".blue() }
+                      else { "other".dimmed() };
 
-            if let Some(ref filter) = network_filter {
-                if !tag.contains(filter) { continue; }
-            }
-            println!("{:<25} | {:<15}", tag.cyan(), network);
+        if let Some(ref filter) = network_filter {
+            if !tag.contains(filter) { continue; }
         }
+        println!("{:<25} | {:<15}", tag.cyan(), network);
     }
     println!("");
     Ok(())
 }
 
-fn install_version(version: &str, versions_dir: &Path) -> Result<()> {
-    let full_tag = if version.starts_with('v') && !version.contains("net") { 
-        format!("mainnet-{}", version) 
-    } else { 
-        version.to_string() 
+fn install_version(version: &str, versions_dir: &Path, svm_dir: &Path) -> Result<()> {
+    let full_tag = if version.starts_with('v') && !version.contains("net") {
+        format!("mainnet-{}", version)
+    } else {
+        version.to_string()
     };
-    
+
     let target_dir = versions_dir.join(&full_tag);
     if target_dir.exists() {
         println!("{} Version {} is already installed.", "ℹ".blue(), full_tag.cyan());
@@ -261,7 +372,7 @@ fn install_version(version: &str, versions_dir: &Path) -> Result<()> {
         "aarch64" => "arm64",
         arch => return Err(anyhow!("Unsupported architecture: {}", arch)),
     };
-    
+
     // Windows support is limited as we rely on .tgz and shim execution which might need tweaks
     if std::env::consts::OS == "windows" {
          println!("{} Warning: Windows support is experimental.", "⚠".yellow());
@@ -273,38 +384,75 @@ fn install_version(version: &str, versions_dir: &Path) -> Result<()> {
         full_tag, asset_name
     );
 
-    println!("{} Downloading {}...", "⬇".blue(), full_tag.cyan());
-    
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(USER_AGENT)
-        .build()?;
-    let response = client.get(&url).send()?;
+    let cache = cache_dir(svm_dir)?;
+    let cached_archive = cache.join(&asset_name);
 
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "{} Release not found: {}.\n{} Run '{}' to see available versions.", 
-            "error:".red().bold(),
-            full_tag.yellow(),
-            "help:".blue().bold(),
-            "svm remote-list".cyan()
-        ));
+    // Check download cache
+    let archive_bytes = if cached_archive.exists() {
+        println!("{} Using cached archive for {}...", "ℹ".blue(), full_tag.cyan());
+        fs::read(&cached_archive)?
+    } else {
+        println!("{} Downloading {}...", "⬇".blue(), full_tag.cyan());
+
+        let client = build_client()?;
+        let response = client.get(&url).send()?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "{} Release not found: {}.\n{} Run '{}' to see available versions.",
+                "error:".red().bold(),
+                full_tag.yellow(),
+                "help:".blue().bold(),
+                "svm remote-list".cyan()
+            ));
+        }
+
+        let total_size = response.content_length().unwrap_or(0);
+        let pb = ProgressBar::new(total_size);
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+            .unwrap()
+            .progress_chars("#>-"));
+
+        let mut bytes = Vec::new();
+        pb.wrap_read(response).read_to_end(&mut bytes)?;
+        pb.finish_with_message("Download complete");
+
+        // Cache the downloaded archive
+        let _ = fs::write(&cached_archive, &bytes);
+
+        bytes
+    };
+
+    // MD5 verification — try to fetch .md5 sidecar
+    let md5_url = format!("{}.md5", url);
+    if let Ok(md5_resp) = build_client()?.get(&md5_url).send() {
+        if md5_resp.status().is_success() {
+            if let Ok(expected) = md5_resp.text() {
+                let expected = expected.trim().split_whitespace().next().unwrap_or("").to_lowercase();
+                let actual = format!("{:x}", md5::compute(&archive_bytes));
+                if !expected.is_empty() && actual != expected {
+                    // Remove corrupted cached archive
+                    let _ = fs::remove_file(&cached_archive);
+                    return Err(anyhow!(
+                        "{} MD5 verification failed.\n  Expected: {}\n  Got:      {}\n{} The archive may be corrupted. Please retry.",
+                        "error:".red().bold(),
+                        expected.yellow(),
+                        actual.yellow(),
+                        "help:".blue().bold(),
+                    ));
+                }
+                println!("{} MD5 checksum verified.", "✔".green());
+            }
+        }
     }
 
-    let total_size = response.content_length().unwrap_or(0);
-    let pb = ProgressBar::new(total_size);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-        .unwrap()
-        .progress_chars("#>-"));
-
-    let reader = pb.wrap_read(response);
-    let tar = flate2::read::GzDecoder::new(reader);
+    // Extract
+    let tar = flate2::read::GzDecoder::new(archive_bytes.as_slice());
     let mut archive = tar::Archive::new(tar);
 
     fs::create_dir_all(&target_dir)?;
     archive.unpack(&target_dir)?;
-
-    pb.finish_with_message("Download complete");
 
     if cfg!(target_os = "macos") {
         let _ = Command::new("sh")
@@ -332,7 +480,7 @@ fn uninstall_version(version: &str, versions_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn use_version(version: &str, versions_dir: &Path, bin_dir: &Path) -> Result<()> {
+fn use_version(version: &str, versions_dir: &Path, bin_dir: &Path, local: bool) -> Result<()> {
     let version_path = versions_dir.join(version);
     if !version_path.exists() {
         return Err(anyhow!(
@@ -344,8 +492,19 @@ fn use_version(version: &str, versions_dir: &Path, bin_dir: &Path) -> Result<()>
         ));
     }
 
-    let current_exe = std::env::current_exe()?;
+    if local {
+        let cwd = std::env::current_dir()?;
+        let version_file = cwd.join(".svm-version");
+        fs::write(&version_file, format!("{}\n", version))?;
+        println!("{} Set local version to {} in {}", "✔".green(), version.green().bold(), version_file.display().to_string().dimmed());
+    } else {
+        let svm_dir = versions_dir.parent().unwrap();
+        fs::write(svm_dir.join("version"), version)?;
+        println!("{} Active version set to: {}", "✨".green(), version.green().bold());
+    }
 
+    // Ensure shims exist regardless of local/global
+    let current_exe = std::env::current_exe()?;
     for bin in SVM_BINARIES {
         let shim_path = bin_dir.join(bin);
         if shim_path.exists() || shim_path.is_symlink() {
@@ -354,10 +513,6 @@ fn use_version(version: &str, versions_dir: &Path, bin_dir: &Path) -> Result<()>
         symlink(&current_exe, &shim_path)?;
     }
 
-    let svm_dir = versions_dir.parent().unwrap();
-    fs::write(svm_dir.join("version"), version)?;
-
-    println!("{} Active version set to: {}", "✨".green(), version.green().bold());
     Ok(())
 }
 
@@ -397,13 +552,13 @@ fn list_local(versions_dir: &Path, svm_dir: &Path) -> Result<()> {
     let mut entries: Vec<_> = fs::read_dir(versions_dir)?
         .filter_map(|e| e.ok())
         .collect();
-    
+
     entries.sort_by_key(|e| e.file_name());
 
     for entry in entries {
         let name = entry.file_name().to_string_lossy().into_owned();
 
-        if Some(name.clone()) == current {
+        if current.as_deref() == Some(&name) {
             println!("{} {:<25} {}", "✔".green(), name.green().bold(), "(active)".dimmed());
         } else {
             println!("  {:<25}", name.dimmed());
