@@ -24,13 +24,16 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// List available versions on GitHub
+    /// List available versions on GitHub (uses fzf if available)
     RemoteList {
         #[arg(short, long)]
         network: Option<String>, // e.g., "mainnet", "testnet"
         /// Max number of pages to fetch (100 releases per page)
         #[arg(short = 'p', long, default_value = "3", value_parser = clap::value_parser!(u32).range(1..))]
         pages: u32,
+        /// Print plain table without fzf
+        #[arg(long)]
+        plain: bool,
     },
     /// Install a version (e.g., v1.63.4 or mainnet-v1.63.4)
     Install { version: String },
@@ -81,7 +84,7 @@ pub fn run() -> Result<()> {
     fs::create_dir_all(&bin_dir)?;
 
     match cli.command {
-        Commands::RemoteList { network, pages } => list_remote(network, &svm_dir, pages)?,
+        Commands::RemoteList { network, pages, plain } => list_remote(network, &svm_dir, pages, plain)?,
         Commands::Install { version } => install_version(&version, &versions_dir, &svm_dir)?,
         Commands::Uninstall { version } => uninstall_version(&version, &versions_dir)?,
         Commands::Use { version, local } => use_version(&version, &versions_dir, &bin_dir, local)?,
@@ -99,16 +102,33 @@ pub fn run() -> Result<()> {
                     generate(Zsh, &mut cmd, bin_name, &mut buffer);
                     let script = String::from_utf8(buffer)?;
 
-                    let custom_func = r#"
-        _svm_versions() {
+                    let custom_funcs = r#"
+        _svm_local_versions() {
             local -a versions
             versions=($(ls -1 $HOME/.svm/versions 2>/dev/null))
             _describe 'installed versions' versions
         }
+        _svm_remote_versions() {
+            local -a versions
+            local cache_file="$HOME/.svm/cache/releases.json"
+            if [[ -f "$cache_file" ]]; then
+                versions=($(cat "$cache_file" | python3 -c "import sys,json;[print(r['tag_name']) for r in json.load(sys.stdin).get('releases',[])]" 2>/dev/null))
+            fi
+            if [[ ${#versions[@]} -eq 0 ]]; then
+                versions=($(svm remote-list --plain 2>/dev/null | tail -n +3 | awk '{print $1}' | grep -v '^$'))
+            fi
+            _describe 'available versions' versions
+        }
         "#;
 
-                    let mut final_script = script.replace("#compdef svm", &format!("#compdef svm\n{}", custom_func));
-                    final_script = final_script.replace("':version:_default'", "':version:_svm_versions'");
+                    let mut final_script = script.replace("#compdef svm", &format!("#compdef svm\n{}", custom_funcs));
+
+                    // install should complete with remote versions
+                    final_script = final_script.replacen("':version:_default'", "':version:_svm_remote_versions'", 1);
+                    // use and uninstall should complete with local versions
+                    final_script = final_script.replace("':version:_default'", "':version:_svm_local_versions'");
+                    // link name gets no special completion (user picks the name)
+                    final_script = final_script.replace("':name:_default'", "':name:'");
 
                     println!("{}", final_script);
                 }
@@ -357,25 +377,139 @@ pub fn fetch_releases_impl(
     Ok(all_releases)
 }
 
-fn list_remote(network_filter: Option<String>, svm_dir: &Path, max_pages: u32) -> Result<()> {
+// Gruvbox Material Dark truecolor palette
+const C_GREEN: &str = "\x1b[38;2;169;182;101m";   // #a9b665
+const C_YELLOW: &str = "\x1b[38;2;216;166;87m";    // #d8a657
+const C_BLUE: &str = "\x1b[38;2;125;174;163m";     // #7daea3
+const C_AQUA: &str = "\x1b[38;2;137;180;130m";     // #89b482
+#[allow(dead_code)]
+const C_ORANGE: &str = "\x1b[38;2;231;138;78m";    // #e78a4e
+const C_FG: &str = "\x1b[38;2;221;199;161m";       // #ddc7a1
+const C_DIM: &str = "\x1b[38;2;141;135;125m";      // #8d877d
+const C_BORDER: &str = "\x1b[38;2;80;73;69m";      // #504945
+const C_RESET: &str = "\x1b[0m";
+const C_BOLD: &str = "\x1b[1m";
+
+fn network_label(tag: &str) -> &'static str {
+    if tag.contains("mainnet") { "mainnet" }
+    else if tag.contains("testnet") { "testnet" }
+    else if tag.contains("devnet") { "devnet" }
+    else { "other" }
+}
+
+fn network_color(net: &str) -> &'static str {
+    match net {
+        "mainnet" => C_GREEN,
+        "testnet" => C_YELLOW,
+        "devnet"  => C_BLUE,
+        _         => C_DIM,
+    }
+}
+
+fn extract_version(tag: &str) -> &str {
+    tag.split_once('-').map(|(_, v)| v).unwrap_or(tag)
+}
+
+fn format_release_line(tag: &str, installed: &[String]) -> String {
+    let net = network_label(tag);
+    let nc = network_color(net);
+    let ver = extract_version(tag);
+    let mark = if installed.contains(&tag.to_string()) {
+        format!(" {C_GREEN}✔{C_RESET}")
+    } else {
+        String::new()
+    };
+    // Pad plain text first, then wrap with color
+    format!(
+        " {nc}●{C_RESET}  {C_AQUA}{C_BOLD}{ver:<12}{C_RESET}  {C_BORDER}│{C_RESET}  {nc}{net:>7}{C_RESET}  {C_BORDER}│{C_RESET}  {C_DIM}{tag}{C_RESET}{mark}"
+    )
+}
+
+fn list_remote(network_filter: Option<String>, svm_dir: &Path, max_pages: u32, plain: bool) -> Result<()> {
     let releases = fetch_releases_cached(svm_dir, max_pages)?;
+    let versions_dir = svm_dir.join("versions");
 
-    println!("\n{:<25} | {:<15}", "Tag Name".bold(), "Network".bold());
-    println!("{}", "-".repeat(45).dimmed());
+    let installed: Vec<String> = if versions_dir.exists() {
+        fs::read_dir(&versions_dir)
+            .ok()
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
 
+    let mut tags: Vec<&str> = Vec::new();
     for release in &releases {
         let tag = release["tag_name"].as_str().unwrap_or("");
-        let network = if tag.contains("mainnet") { "mainnet".green() }
-                      else if tag.contains("testnet") { "testnet".yellow() }
-                      else if tag.contains("devnet") { "devnet".blue() }
-                      else { "other".dimmed() };
-
+        if tag.is_empty() { continue; }
         if let Some(ref filter) = network_filter {
             if !tag.contains(filter) { continue; }
         }
-        println!("{:<25} | {:<15}", tag.cyan(), network);
+        tags.push(tag);
     }
-    println!("");
+
+    if plain || !atty::is(atty::Stream::Stdout) {
+        // Plain output — pad before coloring to keep alignment
+        println!(
+            "\n    {C_FG}{C_BOLD}{:<12}{C_RESET}  {C_BORDER}│{C_RESET}  {C_FG}{C_BOLD}{:>7}{C_RESET}  {C_BORDER}│{C_RESET}  {C_FG}{C_BOLD}{}{C_RESET}",
+            "Version", "Network", "Tag",
+        );
+        println!("    {C_BORDER}{}{C_RESET}", "─".repeat(48));
+        for tag in &tags {
+            let net = network_label(tag);
+            let nc = network_color(net);
+            let ver = extract_version(tag);
+            let mark = if installed.contains(&tag.to_string()) {
+                format!(" {C_GREEN}✔{C_RESET}")
+            } else {
+                String::new()
+            };
+            println!(
+                " {nc}●{C_RESET}  {C_AQUA}{C_BOLD}{ver:<12}{C_RESET}  {C_BORDER}│{C_RESET}  {nc}{net:>7}{C_RESET}  {C_BORDER}│{C_RESET}  {C_DIM}{tag}{C_RESET}{mark}"
+            );
+        }
+        println!();
+    } else {
+        let header = format!(
+            "    {C_FG}{C_BOLD}{:<12}{C_RESET}  {C_BORDER}│{C_RESET}  {C_FG}{C_BOLD}{:>7}{C_RESET}  {C_BORDER}│{C_RESET}  {C_FG}{C_BOLD}{}{C_RESET}",
+            "Version", "Network", "Tag"
+        );
+        let lines: Vec<String> = tags.iter().map(|tag| format_release_line(tag, &installed)).collect();
+        let input = lines.join("\n");
+
+        let mut child = Command::new("fzf")
+            .args([
+                "--ansi",
+                "--reverse",
+                "--header", &header,
+                "--prompt", "  Filter > ",
+                "--pointer", "▶",
+                "--marker", "●",
+                "--color", "header:bold,prompt:#89b482,pointer:#89b482,marker:#a9b665,hl:#e78a4e,hl+:#e78a4e",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .context("fzf is not installed. Use --plain or install fzf.")?;
+
+        if let Some(ref mut stdin) = child.stdin {
+            use std::io::Write;
+            let _ = stdin.write_all(input.as_bytes());
+        }
+        let output = child.wait_with_output()?;
+
+        if output.status.success() {
+            let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if let Some(tag) = tags.iter().find(|t| selected.contains(**t)) {
+                println!("{}", tag);
+            }
+        }
+    }
     Ok(())
 }
 

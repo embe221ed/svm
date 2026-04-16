@@ -123,10 +123,30 @@ fn cli_remote_list_no_network_filter() {
 fn cli_remote_list_network_and_pages() {
     let cli = Cli::try_parse_from(["svm", "remote-list", "-n", "testnet", "-p", "5"]).unwrap();
     match cli.command {
-        Commands::RemoteList { network, pages } => {
+        Commands::RemoteList { network, pages, .. } => {
             assert_eq!(network, Some("testnet".into()));
             assert_eq!(pages, 5);
         }
+        _ => panic!("wrong command"),
+    }
+}
+
+// --- remote-list --plain ---
+
+#[test]
+fn cli_remote_list_plain_flag() {
+    let cli = Cli::try_parse_from(["svm", "remote-list", "--plain"]).unwrap();
+    match cli.command {
+        Commands::RemoteList { plain, .. } => assert!(plain),
+        _ => panic!("wrong command"),
+    }
+}
+
+#[test]
+fn cli_remote_list_default_not_plain() {
+    let cli = Cli::try_parse_from(["svm", "remote-list"]).unwrap();
+    match cli.command {
+        Commands::RemoteList { plain, .. } => assert!(!plain),
         _ => panic!("wrong command"),
     }
 }
