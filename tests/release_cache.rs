@@ -2,7 +2,7 @@ use mockito::{Matcher, Server};
 use serde_json::json;
 use std::fs;
 use std::path::Path;
-use svm::{fetch_releases_impl, ReleaseCache};
+use svm::{fetch_release_assets, fetch_releases_impl, ReleaseCache, ReleaseLookup};
 use tempfile::TempDir;
 
 fn make_releases(n: usize) -> Vec<serde_json::Value> {
@@ -255,7 +255,7 @@ fn etag_changed_triggers_full_refetch() {
         .with_status(200)
         .with_header("etag", "\"new-etag\"")
         .with_body(serde_json::to_string(&new_releases).unwrap())
-        .expect(2) // ETag check + full fetch
+        .expect(1) // ETag check response is reused as page 1 — no second request
         .create();
 
     let url = format!("{}/releases", server.url());
@@ -265,6 +265,81 @@ fn etag_changed_triggers_full_refetch() {
     let saved = read_cache(tmp.path()).unwrap();
     assert_eq!(saved.etag, Some("\"new-etag\"".into()));
     assert_eq!(saved.releases.len(), 75);
+}
+
+#[test]
+fn etag_changed_multi_page_reuses_first_response_and_continues() {
+    let tmp = TempDir::new().unwrap();
+    write_cache(
+        tmp.path(),
+        &ReleaseCache {
+            etag: Some("\"old\"".into()),
+            pages: 2,
+            releases: make_releases(150),
+        },
+    );
+
+    let mut server = Server::new();
+    // Page 1: served once for the ETag check, reused as refetch page 1
+    server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .with_status(200)
+        .with_header("etag", "\"new\"")
+        .with_body(serde_json::to_string(&make_releases(100)).unwrap())
+        .expect(1)
+        .create();
+
+    server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(2))
+        .with_status(200)
+        .with_body(serde_json::to_string(&make_releases(60)).unwrap())
+        .expect(1)
+        .create();
+
+    let url = format!("{}/releases", server.url());
+    let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 2).unwrap();
+    assert_eq!(result.len(), 160);
+
+    let saved = read_cache(tmp.path()).unwrap();
+    assert_eq!(saved.etag, Some("\"new\"".into()));
+    assert_eq!(saved.releases.len(), 160);
+}
+
+#[test]
+fn etag_changed_short_first_page_stops_pagination() {
+    // Reused page 1 has < 100 items → no page 2 request even with max_pages=3
+    let tmp = TempDir::new().unwrap();
+    write_cache(
+        tmp.path(),
+        &ReleaseCache {
+            etag: Some("\"old\"".into()),
+            pages: 3,
+            releases: make_releases(300),
+        },
+    );
+
+    let mut server = Server::new();
+    server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .with_status(200)
+        .with_header("etag", "\"new\"")
+        .with_body(serde_json::to_string(&make_releases(40)).unwrap())
+        .expect(1)
+        .create();
+
+    let m2 = server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(2))
+        .expect(0)
+        .create();
+
+    let url = format!("{}/releases", server.url());
+    let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 3).unwrap();
+    assert_eq!(result.len(), 40);
+    m2.assert();
 }
 
 // --- Page count awareness ---
@@ -762,6 +837,136 @@ fn refetch_with_more_pages_updates_cache_page_count() {
 }
 
 // --- ETag validation returns non-2xx, non-304 (e.g. 403) ---
+
+// --- fetch_release_assets classification ---
+
+#[test]
+fn release_lookup_found_returns_assets() {
+    let mut server = Server::new();
+    server
+        .mock("GET", "/releases/tags/mainnet-v1.0.0")
+        .with_status(200)
+        .with_body(
+            json!({
+                "tag_name": "mainnet-v1.0.0",
+                "assets": [
+                    {"name": "sui-mainnet-v1.0.0-macos-arm64.tgz", "digest": "sha256:abc123"},
+                    {"name": "sui-mainnet-v1.0.0-ubuntu-x86_64.tgz", "digest": null}
+                ]
+            })
+            .to_string(),
+        )
+        .create();
+
+    let base = format!("{}/releases", server.url());
+    match fetch_release_assets(&test_client(), &base, "mainnet-v1.0.0") {
+        ReleaseLookup::Found(assets) => {
+            assert_eq!(assets.len(), 2);
+            assert_eq!(svm::asset_sha256(&assets[0]), Some("abc123".into()));
+            assert_eq!(svm::asset_sha256(&assets[1]), None);
+        }
+        _ => panic!("expected Found"),
+    }
+}
+
+#[test]
+fn release_lookup_404_is_not_found() {
+    let mut server = Server::new();
+    server
+        .mock("GET", "/releases/tags/mainnet-v9.9.9")
+        .with_status(404)
+        .create();
+
+    let base = format!("{}/releases", server.url());
+    assert!(matches!(
+        fetch_release_assets(&test_client(), &base, "mainnet-v9.9.9"),
+        ReleaseLookup::NotFound
+    ));
+}
+
+#[test]
+fn release_lookup_server_error_is_unavailable() {
+    let mut server = Server::new();
+    server
+        .mock("GET", "/releases/tags/mainnet-v1.0.0")
+        .with_status(503)
+        .create();
+
+    let base = format!("{}/releases", server.url());
+    assert!(matches!(
+        fetch_release_assets(&test_client(), &base, "mainnet-v1.0.0"),
+        ReleaseLookup::Unavailable
+    ));
+}
+
+#[test]
+fn release_lookup_garbled_body_is_unavailable() {
+    let mut server = Server::new();
+    server
+        .mock("GET", "/releases/tags/mainnet-v1.0.0")
+        .with_status(200)
+        .with_body("not json at all")
+        .create();
+
+    let base = format!("{}/releases", server.url());
+    assert!(matches!(
+        fetch_release_assets(&test_client(), &base, "mainnet-v1.0.0"),
+        ReleaseLookup::Unavailable
+    ));
+}
+
+// --- Stale-cache fallback on garbled page-1 body ---
+
+#[test]
+fn bad_page1_body_falls_back_to_cache() {
+    let tmp = TempDir::new().unwrap();
+    write_cache(
+        tmp.path(),
+        &ReleaseCache {
+            etag: None,
+            pages: 1,
+            releases: make_releases(70),
+        },
+    );
+
+    let mut server = Server::new();
+    server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .with_status(200)
+        .with_body("<html>proxy error page</html>")
+        .create();
+
+    let url = format!("{}/releases", server.url());
+    let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 1).unwrap();
+    assert_eq!(result.len(), 70);
+}
+
+#[test]
+fn bad_etag_refresh_body_falls_back_to_cache() {
+    let tmp = TempDir::new().unwrap();
+    write_cache(
+        tmp.path(),
+        &ReleaseCache {
+            etag: Some("\"old\"".into()),
+            pages: 1,
+            releases: make_releases(50),
+        },
+    );
+
+    let mut server = Server::new();
+    server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .with_status(200)
+        .with_header("etag", "\"new\"")
+        .with_body("garbled")
+        .create();
+
+    let url = format!("{}/releases", server.url());
+    let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 1).unwrap();
+    assert_eq!(result.len(), 50);
+}
 
 #[test]
 fn etag_check_returns_403_falls_back_to_cache() {

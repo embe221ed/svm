@@ -1,5 +1,5 @@
 use clap::Parser;
-use svm::{Cli, Commands};
+use svm::{CacheAction, Cli, Commands};
 
 // --- pages validation ---
 
@@ -169,7 +169,7 @@ fn cli_uninstall_requires_version() {
 fn cli_install_accepts_any_version_string() {
     let cli = Cli::try_parse_from(["svm", "install", "my-custom-build"]).unwrap();
     match cli.command {
-        Commands::Install { version } => assert_eq!(version, "my-custom-build"),
+        Commands::Install { version, .. } => assert_eq!(version, "my-custom-build"),
         _ => panic!("wrong command"),
     }
 }
@@ -211,10 +211,146 @@ fn cli_completions_requires_shell() {
 }
 
 #[test]
-fn cli_completions_accepts_shell() {
-    let cli = Cli::try_parse_from(["svm", "completions", "zsh"]).unwrap();
+fn cli_completions_accepts_known_shells() {
+    for shell in ["zsh", "bash", "fish"] {
+        let cli = Cli::try_parse_from(["svm", "completions", shell]).unwrap();
+        match cli.command {
+            Commands::Completions { shell: parsed } => assert_eq!(parsed.to_string(), shell),
+            _ => panic!("wrong command"),
+        }
+    }
+}
+
+#[test]
+fn cli_completions_rejects_unknown_shell() {
+    let result = Cli::try_parse_from(["svm", "completions", "tcsh"]);
+    assert!(result.is_err());
+}
+
+// --- install flags ---
+
+#[test]
+fn cli_install_use_flag() {
+    let cli = Cli::try_parse_from(["svm", "install", "--use", "v1.0.0"]).unwrap();
     match cli.command {
-        Commands::Completions { shell } => assert_eq!(shell, "zsh"),
+        Commands::Install { version, use_after } => {
+            assert_eq!(version, "v1.0.0");
+            assert!(use_after);
+        }
+        _ => panic!("wrong command"),
+    }
+}
+
+#[test]
+fn cli_install_use_short_flag() {
+    let cli = Cli::try_parse_from(["svm", "install", "-u", "latest"]).unwrap();
+    match cli.command {
+        Commands::Install { version, use_after } => {
+            assert_eq!(version, "latest");
+            assert!(use_after);
+        }
+        _ => panic!("wrong command"),
+    }
+}
+
+#[test]
+fn cli_install_default_not_use() {
+    let cli = Cli::try_parse_from(["svm", "install", "v1.0.0"]).unwrap();
+    match cli.command {
+        Commands::Install { use_after, .. } => assert!(!use_after),
+        _ => panic!("wrong command"),
+    }
+}
+
+// --- remote-list new flags ---
+
+#[test]
+fn cli_remote_list_tags_only_flag() {
+    let cli = Cli::try_parse_from(["svm", "remote-list", "--tags-only"]).unwrap();
+    match cli.command {
+        Commands::RemoteList { tags_only, .. } => assert!(tags_only),
+        _ => panic!("wrong command"),
+    }
+}
+
+#[test]
+fn cli_remote_list_cached_flag() {
+    let cli = Cli::try_parse_from(["svm", "remote-list", "--cached", "--tags-only"]).unwrap();
+    match cli.command {
+        Commands::RemoteList { cached, tags_only, .. } => {
+            assert!(cached);
+            assert!(tags_only);
+        }
+        _ => panic!("wrong command"),
+    }
+}
+
+// --- update ---
+
+#[test]
+fn cli_update_no_args() {
+    let cli = Cli::try_parse_from(["svm", "update"]).unwrap();
+    assert!(matches!(cli.command, Commands::Update));
+}
+
+#[test]
+fn cli_update_rejects_extra_args() {
+    let result = Cli::try_parse_from(["svm", "update", "v1.0.0"]);
+    assert!(result.is_err());
+}
+
+// --- link with optional path ---
+
+#[test]
+fn cli_link_accepts_optional_path() {
+    let cli = Cli::try_parse_from(["svm", "link", "my-dev", "/some/build/dir"]).unwrap();
+    match cli.command {
+        Commands::Link { name, path } => {
+            assert_eq!(name, "my-dev");
+            assert_eq!(path.unwrap().to_string_lossy(), "/some/build/dir");
+        }
+        _ => panic!("wrong command"),
+    }
+}
+
+#[test]
+fn cli_link_path_defaults_to_none() {
+    let cli = Cli::try_parse_from(["svm", "link", "my-dev"]).unwrap();
+    match cli.command {
+        Commands::Link { path, .. } => assert!(path.is_none()),
+        _ => panic!("wrong command"),
+    }
+}
+
+// --- cache ---
+
+#[test]
+fn cli_cache_no_action() {
+    let cli = Cli::try_parse_from(["svm", "cache"]).unwrap();
+    match cli.command {
+        Commands::Cache { action } => assert!(action.is_none()),
+        _ => panic!("wrong command"),
+    }
+}
+
+#[test]
+fn cli_cache_clean() {
+    let cli = Cli::try_parse_from(["svm", "cache", "clean"]).unwrap();
+    match cli.command {
+        Commands::Cache { action } => {
+            assert!(matches!(action, Some(CacheAction::Clean { all: false })));
+        }
+        _ => panic!("wrong command"),
+    }
+}
+
+#[test]
+fn cli_cache_clean_all() {
+    let cli = Cli::try_parse_from(["svm", "cache", "clean", "--all"]).unwrap();
+    match cli.command {
+        Commands::Cache { action } => {
+            assert!(matches!(action, Some(CacheAction::Clean { all: true })));
+        }
         _ => panic!("wrong command"),
     }
 }

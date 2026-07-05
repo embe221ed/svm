@@ -49,6 +49,13 @@ fn version_with_net_in_name_but_no_standard_prefix() {
 }
 
 #[test]
-fn number_only_no_v_unchanged() {
-    assert_eq!(normalize_install_tag("1.63.4"), "1.63.4");
+fn number_only_no_v_gets_mainnet_prefix() {
+    // A bare "1.63.4" is clearly a version — treat it like "v1.63.4"
+    assert_eq!(normalize_install_tag("1.63.4"), "mainnet-v1.63.4");
+}
+
+#[test]
+fn four_component_version_unchanged() {
+    // Not a valid semver triple — leave it alone
+    assert_eq!(normalize_install_tag("1.2.3.4"), "1.2.3.4");
 }

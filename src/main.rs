@@ -1,5 +1,6 @@
-use anyhow::Result;
-
-fn main() -> Result<()> {
-    svm::run()
+fn main() {
+    if let Err(e) = svm::run() {
+        svm::report_error(&e);
+        std::process::exit(1);
+    }
 }
