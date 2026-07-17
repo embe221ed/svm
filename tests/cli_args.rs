@@ -322,6 +322,74 @@ fn cli_link_path_defaults_to_none() {
     }
 }
 
+// --- which ---
+
+#[test]
+fn cli_which_defaults_to_sui() {
+    let cli = Cli::try_parse_from(["svm", "which"]).unwrap();
+    match cli.command {
+        Commands::Which { binary } => assert_eq!(binary, "sui"),
+        _ => panic!("wrong command"),
+    }
+}
+
+#[test]
+fn cli_which_accepts_binary_name() {
+    let cli = Cli::try_parse_from(["svm", "which", "move-analyzer"]).unwrap();
+    match cli.command {
+        Commands::Which { binary } => assert_eq!(binary, "move-analyzer"),
+        _ => panic!("wrong command"),
+    }
+}
+
+#[test]
+fn cli_which_rejects_extra_args() {
+    let result = Cli::try_parse_from(["svm", "which", "sui", "extra"]);
+    assert!(result.is_err());
+}
+
+// --- exec ---
+
+#[test]
+fn cli_exec_requires_version_and_command() {
+    assert!(Cli::try_parse_from(["svm", "exec"]).is_err());
+    assert!(Cli::try_parse_from(["svm", "exec", "v1.0.0"]).is_err());
+}
+
+#[test]
+fn cli_exec_captures_command_and_args() {
+    let cli = Cli::try_parse_from(["svm", "exec", "testnet-v1.2.3", "sui", "move", "test"]).unwrap();
+    match cli.command {
+        Commands::Exec { version, command } => {
+            assert_eq!(version, "testnet-v1.2.3");
+            assert_eq!(command, vec!["sui", "move", "test"]);
+        }
+        _ => panic!("wrong command"),
+    }
+}
+
+#[test]
+fn cli_exec_passes_hyphen_args_through() {
+    // Flags after the command belong to the command, not to svm
+    let cli = Cli::try_parse_from(["svm", "exec", "v1.0.0", "sui", "--version"]).unwrap();
+    match cli.command {
+        Commands::Exec { version, command } => {
+            assert_eq!(version, "v1.0.0");
+            assert_eq!(command, vec!["sui", "--version"]);
+        }
+        _ => panic!("wrong command"),
+    }
+}
+
+#[test]
+fn cli_exec_supports_double_dash_separator() {
+    let cli = Cli::try_parse_from(["svm", "exec", "v1.0.0", "--", "sui", "client", "gas"]).unwrap();
+    match cli.command {
+        Commands::Exec { command, .. } => assert_eq!(command, vec!["sui", "client", "gas"]),
+        _ => panic!("wrong command"),
+    }
+}
+
 // --- cache ---
 
 #[test]

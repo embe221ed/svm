@@ -355,12 +355,15 @@ fn load_cached_releases_none_when_missing_or_corrupt() {
 #[test]
 fn zsh_completions_wire_dynamic_version_functions() {
     let script = completion_script(clap_complete::Shell::Zsh);
-    // install completes remote versions; use + uninstall complete local ones
+    // install completes remote versions; use + uninstall + exec complete local ones
     assert_eq!(script.matches(":version:_svm_remote_versions").count(), 1);
-    assert_eq!(script.matches(":version:_svm_local_versions").count(), 2);
+    assert_eq!(script.matches(":version:_svm_local_versions").count(), 3);
     // No placeholder left un-replaced — if clap_complete changes its output
     // format, this catches the silent breakage
     assert_eq!(script.matches(":version:_default").count(), 0);
+    // which completes the managed binary names
+    assert!(script.contains("'::binary:(sui move-analyzer)'"));
+    assert_eq!(script.matches(":binary:_default").count(), 0);
     assert!(script.contains("_svm_remote_versions()"));
     assert!(script.contains("_svm_local_versions()"));
     // Dynamic completion must not depend on python3

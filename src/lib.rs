@@ -13,8 +13,28 @@ use std::process::{Command, Stdio};
 
 pub const GITHUB_API: &str = "https://api.github.com/repos/MystenLabs/sui/releases";
 const DOWNLOAD_BASE: &str = "https://github.com/MystenLabs/sui/releases/download";
+
+/// Release-metadata API base. SVM_API_BASE overrides it (mirrors, tests).
+fn api_base() -> String {
+    env_override("SVM_API_BASE").unwrap_or_else(|| GITHUB_API.to_string())
+}
+
+/// Release-archive download base. SVM_DOWNLOAD_BASE overrides it.
+fn download_base() -> String {
+    env_override("SVM_DOWNLOAD_BASE").unwrap_or_else(|| DOWNLOAD_BASE.to_string())
+}
+
+fn env_override(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+}
 const USER_AGENT: &str = "svm-cli";
 const SVM_BINARIES: &[&str] = &["sui", "move-analyzer"];
+/// Marker file written into a linked build's directory recording where each
+/// binary was copied from ("<binary> <source path>" per line).
+const LINK_MARKER: &str = ".svm-link";
 pub const NETWORKS: &[&str] = &["mainnet", "testnet", "devnet"];
 
 #[derive(Parser)]
@@ -63,6 +83,13 @@ pub enum Commands {
         #[arg(short, long)]
         local: bool,
     },
+    /// Run a command under a specific installed version without switching
+    Exec {
+        version: String,
+        /// Command and arguments (e.g. sui move test)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
     /// Link a local build (e.g. svm link custom-dev)
     Link {
         name: String,
@@ -74,6 +101,11 @@ pub enum Commands {
     List,
     /// Show the currently active version
     Show,
+    /// Print the full path of the binary the active version resolves to
+    Which {
+        #[arg(default_value = "sui")]
+        binary: String,
+    },
     /// Deactivate svm by removing shims
     Unset,
     /// Inspect or clean the download cache
@@ -163,6 +195,8 @@ pub fn run() -> Result<()> {
         Commands::Update => update_version(&versions_dir, &svm_dir)?,
         Commands::Uninstall { version } => uninstall_version(&version, &versions_dir, &svm_dir)?,
         Commands::Use { version, local } => use_version(&version, &versions_dir, &bin_dir, local)?,
+        Commands::Exec { version, command } => exec_command(&version, &command, &versions_dir)?,
+        Commands::Which { binary } => which_command(&binary, &svm_dir)?,
         Commands::Link { name, path } => link_local(&name, path.as_deref(), &versions_dir)?,
         Commands::List => list_local(&versions_dir, &svm_dir)?,
         Commands::Show => show_version(&svm_dir)?,
@@ -206,52 +240,66 @@ pub fn resolve_version(svm_dir: &Path) -> Result<Option<(String, VersionSource)>
     Ok(None)
 }
 
-fn run_shim(binary_name: &str, args: &[String]) -> Result<()> {
-    let svm_dir = dirs::home_dir().context("No home dir")?.join(".svm");
+fn err_not_active() -> anyhow::Error {
+    anyhow!(
+        "{} SVM is not active. Run '{}' or create a {} file.",
+        "error:".red().bold(),
+        "svm use <version>".cyan(),
+        ".svm-version".cyan()
+    )
+}
 
-    let (version, _) = resolve_version(&svm_dir)?
-        .ok_or_else(|| anyhow!(
-            "{} SVM is not active. Run '{}' or create a {} file.",
-            "error:".red().bold(),
-            "svm use <version>".cyan(),
-            ".svm-version".cyan()
-        ))?;
+/// Replace control characters before showing an untrusted string (a hostile
+/// .svm-version could otherwise inject terminal escape sequences into
+/// prompts and error messages).
+fn sanitize_display(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
 
-    let versions_dir = svm_dir.join("versions");
-    let (resolved, version_dir) = resolve_installed_version(&version, &versions_dir)
-        .ok_or_else(|| anyhow!(
-            "{} Version '{}' is set but not installed.\n{} Run '{}' to install it.",
-            "error:".red().bold(),
-            version.yellow(),
-            "help:".blue().bold(),
-            format!("svm install {}", version).cyan()
-        ))?;
+fn err_not_installed(version: &str) -> anyhow::Error {
+    let version = sanitize_display(version);
+    anyhow!(
+        "{} Version '{}' is set but not installed.\n{} Run '{}' to install it.",
+        "error:".red().bold(),
+        version.yellow(),
+        "help:".blue().bold(),
+        format!("svm install {}", version).cyan()
+    )
+}
 
+/// Path of `binary_name` inside an installed version's directory, with the
+/// shim's diagnostics: a dangling symlink (stale linked build from older svm
+/// versions) and a missing binary get distinct errors.
+fn locate_binary(version_dir: &Path, resolved: &str, binary_name: &str) -> Result<PathBuf> {
     let binary_path = version_dir.join(binary_name);
-
-    if !binary_path.exists() {
-        if binary_path.is_symlink() {
-            return Err(anyhow!(
-                "{} '{}' in version '{}' points to a build that no longer exists.\n{} Rebuild it, then re-run '{}' from your build directory.",
-                "error:".red().bold(),
-                binary_name.yellow(),
-                resolved.cyan(),
-                "help:".blue().bold(),
-                format!("svm link {}", resolved).cyan()
-            ));
-        }
+    if binary_path.exists() {
+        return Ok(binary_path);
+    }
+    if binary_path.is_symlink() {
         return Err(anyhow!(
-            "{} Binary '{}' not found for version '{}'.\n{} Run '{}' to install it.",
+            "{} '{}' in version '{}' points to a build that no longer exists.\n{} Rebuild it, then re-run '{}' from your build directory.",
             "error:".red().bold(),
             binary_name.yellow(),
             resolved.cyan(),
             "help:".blue().bold(),
-            format!("svm install {}", resolved).cyan()
+            format!("svm link {}", resolved).cyan()
         ));
     }
+    Err(anyhow!(
+        "{} Binary '{}' not found for version '{}'.\n{} Run '{}' to install it.",
+        "error:".red().bold(),
+        binary_name.yellow(),
+        resolved.cyan(),
+        "help:".blue().bold(),
+        format!("svm install {}", resolved).cyan()
+    ))
+}
 
-    // Guard against exec'ing ourselves in a loop (e.g. a linked build whose
-    // "sui" is actually the svm binary).
+/// Guard against exec'ing ourselves in a loop (e.g. a linked build whose
+/// "sui" is actually the svm binary).
+fn refuse_self_exec(binary_path: &Path, binary_name: &str, version: &str) -> Result<()> {
     if let (Ok(target), Ok(me)) = (
         binary_path.canonicalize(),
         std::env::current_exe().and_then(|p| p.canonicalize()),
@@ -261,10 +309,13 @@ fn run_shim(binary_name: &str, args: &[String]) -> Result<()> {
             "{} '{}' in version '{}' resolves to svm itself — refusing to exec in a loop.",
             "error:".red().bold(),
             binary_name.yellow(),
-            resolved.cyan()
+            version.cyan()
         ));
     }
+    Ok(())
+}
 
+fn exec_binary(binary_path: &Path, args: &[String]) -> Result<()> {
     let err = Command::new(binary_path)
         .args(args)
         .stdin(Stdio::inherit())
@@ -273,6 +324,160 @@ fn run_shim(binary_name: &str, args: &[String]) -> Result<()> {
         .exec();
 
     Err(anyhow!("Failed to execute binary: {}", err))
+}
+
+enum AutoInstall {
+    /// SVM_AUTO_INSTALL unset or unrecognized: offer interactively.
+    Ask,
+    /// SVM_AUTO_INSTALL truthy: install without asking.
+    Always,
+    /// SVM_AUTO_INSTALL falsy: never install from the shim.
+    Never,
+}
+
+fn auto_install_mode() -> AutoInstall {
+    match std::env::var("SVM_AUTO_INSTALL") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "y" | "on" => AutoInstall::Always,
+            "0" | "false" | "no" | "n" | "off" => AutoInstall::Never,
+            _ => AutoInstall::Ask,
+        },
+        Err(_) => AutoInstall::Ask,
+    }
+}
+
+/// Install a pinned-but-missing version from the shim path, so a cloned repo
+/// with a .svm-version works without a manual `svm install`. Returns None
+/// when installation was declined or not permitted; the caller falls back to
+/// the plain "not installed" error.
+fn shim_auto_install(
+    version: &str,
+    versions_dir: &Path,
+    svm_dir: &Path,
+) -> Result<Option<(String, PathBuf)>> {
+    let shown = sanitize_display(version);
+    match auto_install_mode() {
+        AutoInstall::Never => return Ok(None),
+        AutoInstall::Always => eprintln!(
+            "{} Version {} is not installed — installing it now (SVM_AUTO_INSTALL).",
+            "ℹ".blue(),
+            shown.cyan()
+        ),
+        AutoInstall::Ask => {
+            let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+            if !interactive
+                || !prompt_yes_no(&format!(
+                    "Version {} is not installed. Install it now?",
+                    shown.cyan()
+                ))?
+            {
+                return Ok(None);
+            }
+        }
+    }
+    // Install without activating: the version file that led us here already
+    // selects this version, so touching the global default would be wrong.
+    let tag = install_version(version, versions_dir, svm_dir, false, false)?;
+    Ok(resolve_installed_version(&tag, versions_dir))
+}
+
+fn run_shim(binary_name: &str, args: &[String]) -> Result<()> {
+    let svm_dir = dirs::home_dir().context("No home dir")?.join(".svm");
+
+    let (version, _) = resolve_version(&svm_dir)?.ok_or_else(err_not_active)?;
+
+    let versions_dir = svm_dir.join("versions");
+    let (resolved, version_dir) = match resolve_available_version(&version, &versions_dir) {
+        Some(found) => found,
+        None => shim_auto_install(&version, &versions_dir, &svm_dir)?
+            .ok_or_else(|| err_not_installed(&version))?,
+    };
+
+    let binary_path = locate_binary(&version_dir, &resolved, binary_name)?;
+    refuse_self_exec(&binary_path, binary_name, &resolved)?;
+    exec_binary(&binary_path, args)
+}
+
+fn which_command(binary: &str, svm_dir: &Path) -> Result<()> {
+    if !valid_version_name(binary) {
+        return Err(anyhow!(
+            "{} Invalid binary name: {}",
+            "error:".red().bold(),
+            binary.yellow()
+        ));
+    }
+
+    let (version, _) = resolve_version(svm_dir)?.ok_or_else(err_not_active)?;
+
+    let versions_dir = svm_dir.join("versions");
+    let (resolved, version_dir) = resolve_available_version(&version, &versions_dir)
+        .ok_or_else(|| err_not_installed(&version))?;
+
+    let binary_path = locate_binary(&version_dir, &resolved, binary)?;
+    println!("{}", binary_path.display());
+    Ok(())
+}
+
+fn exec_command(version: &str, command: &[String], versions_dir: &Path) -> Result<()> {
+    let (resolved, version_dir) = resolve_available_version(version, versions_dir)
+        .ok_or_else(|| anyhow!(
+            "{} Version '{}' is not installed.\n{} Run '{}' first.",
+            "error:".red().bold(),
+            version.yellow(),
+            "help:".blue().bold(),
+            format!("svm install {}", version).cyan()
+        ))?;
+
+    let (program, args) = command
+        .split_first()
+        .context("exec requires a command (enforced by clap)")?;
+
+    // Managed binaries must come from the selected version — a PATH fallback
+    // could silently reach the shim and run the *active* version instead.
+    let program_path = if SVM_BINARIES.contains(&program.as_str()) {
+        locate_binary(&version_dir, &resolved, program)?
+    } else {
+        let candidate = version_dir.join(program);
+        if !program.contains('/') && candidate.exists() {
+            candidate
+        } else {
+            PathBuf::from(program)
+        }
+    };
+    refuse_self_exec(&program_path, program, &resolved)?;
+
+    let mut cmd = Command::new(&program_path);
+    cmd.args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    // Put the version's directory first on PATH so the command and any
+    // subprocesses it spawns resolve this version's binaries. A directory
+    // that can't be joined (a ':' in the path) is not fatal — managed
+    // binaries were already resolved to absolute paths above.
+    match std::env::var_os("PATH") {
+        Some(old) => {
+            let mut parts = vec![version_dir.clone()];
+            parts.extend(std::env::split_paths(&old));
+            match std::env::join_paths(parts) {
+                Ok(joined) => {
+                    cmd.env("PATH", joined);
+                }
+                Err(_) => eprintln!(
+                    "{} Could not prepend {:?} to PATH (path contains a separator) — running with the unmodified PATH.",
+                    "⚠".yellow(),
+                    version_dir
+                ),
+            }
+        }
+        None => {
+            cmd.env("PATH", &version_dir);
+        }
+    }
+
+    let err = cmd.exec();
+    Err(anyhow!("Failed to execute '{}': {}", program_path.display(), err))
 }
 
 fn unset_version(bin_dir: &Path, svm_dir: &Path) -> Result<()> {
@@ -312,7 +517,7 @@ fn show_version(svm_dir: &Path) -> Result<()> {
                 }
             }
             let versions_dir = svm_dir.join("versions");
-            if resolve_installed_version(&v, &versions_dir).is_none() {
+            if resolve_available_version(&v, &versions_dir).is_none() {
                 println!(
                     "  {} not installed — run '{}'",
                     "⚠".yellow(),
@@ -333,7 +538,13 @@ fn show_version(svm_dir: &Path) -> Result<()> {
 
 pub fn build_client() -> Result<reqwest::blocking::Client> {
     let mut builder = reqwest::blocking::Client::builder().user_agent(USER_AGENT);
-    if let Ok(token) = std::env::var("GITHUB_TOKEN")
+    // Never attach the GitHub token when the endpoints are overridden: it is
+    // a default header on every request this client makes, and it must not
+    // leak to whatever host SVM_API_BASE/SVM_DOWNLOAD_BASE point at.
+    let endpoints_overridden =
+        env_override("SVM_API_BASE").is_some() || env_override("SVM_DOWNLOAD_BASE").is_some();
+    if !endpoints_overridden
+        && let Ok(token) = std::env::var("GITHUB_TOKEN")
         && !token.trim().is_empty()
     {
         use reqwest::header;
@@ -371,7 +582,7 @@ pub fn load_cached_releases(svm_dir: &Path) -> Option<Vec<serde_json::Value>> {
 /// Fetch releases with ETag-based caching and pagination.
 fn fetch_releases_cached(svm_dir: &Path, max_pages: u32) -> Result<Vec<serde_json::Value>> {
     let client = build_client()?;
-    fetch_releases_impl(&client, GITHUB_API, svm_dir, max_pages)
+    fetch_releases_impl(&client, &api_base(), svm_dir, max_pages)
 }
 
 fn header_etag(resp: &reqwest::blocking::Response) -> Option<String> {
@@ -970,7 +1181,9 @@ fn download_archive(
     dest: &Path,
     label: &str,
 ) -> Result<()> {
-    println!("{} Downloading {}...", "⬇".blue(), label.cyan());
+    // Status messages in the install pipeline go to stderr: the shim's
+    // auto-install path may run while the caller's stdout is piped.
+    eprintln!("{} Downloading {}...", "⬇".blue(), label.cyan());
 
     let response = client.get(url).send()?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -1025,7 +1238,7 @@ fn download_archive(
     match result {
         Ok(bytes) => {
             fs::rename(&partial, dest)?;
-            println!("{} Downloaded {}.", "✔".green(), human_bytes(bytes));
+            eprintln!("{} Downloaded {}.", "✔".green(), human_bytes(bytes));
             Ok(())
         }
         Err(e) => {
@@ -1106,7 +1319,7 @@ fn install_version(
     let bin_dir = svm_dir.join("bin");
     let target_dir = versions_dir.join(&full_tag);
     if target_dir.exists() {
-        println!("{} Version {} is already installed.", "ℹ".blue(), full_tag.cyan());
+        eprintln!("{} Version {} is already installed.", "ℹ".blue(), full_tag.cyan());
         if use_after {
             use_version(&full_tag, versions_dir, &bin_dir, false)?;
         }
@@ -1115,14 +1328,14 @@ fn install_version(
 
     let (os_part, arch_part) = platform_parts()?;
     let asset_name = format!("sui-{}-{}-{}.tgz", full_tag, os_part, arch_part);
-    let url = format!("{}/{}/{}", DOWNLOAD_BASE, full_tag, asset_name);
+    let url = format!("{}/{}/{}", download_base(), full_tag, asset_name);
 
     let client = build_client()?;
 
     // Look up the release before downloading: confirms the tag exists, catches
     // releases without a build for this platform, and yields the sha256 digest
     // GitHub publishes per asset.
-    let expected_sha256 = match fetch_release_assets(&client, GITHUB_API, &full_tag) {
+    let expected_sha256 = match fetch_release_assets(&client, &api_base(), &full_tag) {
         ReleaseLookup::NotFound => {
             return Err(anyhow!(
                 "{} Release not found: {}.\n{} Run '{}' to see available versions.",
@@ -1169,7 +1382,7 @@ fn install_version(
 
     let from_cache = archive_path.exists();
     if from_cache {
-        println!("{} Using cached archive for {}...", "ℹ".blue(), full_tag.cyan());
+        eprintln!("{} Using cached archive for {}...", "ℹ".blue(), full_tag.cyan());
     } else {
         download_archive(&client, &url, &archive_path, &full_tag)?;
     }
@@ -1195,7 +1408,7 @@ fn install_version(
                 "help:".blue().bold()
             ));
         }
-        println!("{} SHA-256 checksum verified.", "✔".green());
+        eprintln!("{} SHA-256 checksum verified.", "✔".green());
     }
 
     unpack_archive(&archive_path, versions_dir, &full_tag)?;
@@ -1208,7 +1421,7 @@ fn install_version(
             .status();
     }
 
-    println!(
+    eprintln!(
         "{} Successfully installed {} to {:?}",
         "✔".green(),
         full_tag.green().bold(),
@@ -1216,7 +1429,7 @@ fn install_version(
     );
 
     if !target_dir.join("sui").exists() {
-        println!(
+        eprintln!(
             "{} The archive did not contain a 'sui' binary at its top level — the layout may have changed.",
             "⚠".yellow()
         );
@@ -1227,10 +1440,10 @@ fn install_version(
     } else if auto_activate {
         // auto_activate is false when a caller (e.g. `svm use`) activates itself
         if resolve_version(svm_dir)?.is_none() {
-            println!("{} No version was active — activating {}.", "ℹ".blue(), full_tag.cyan());
+            eprintln!("{} No version was active — activating {}.", "ℹ".blue(), full_tag.cyan());
             use_version(&full_tag, versions_dir, &bin_dir, false)?;
         } else {
-            println!("  Run '{}' to switch to it.", format!("svm use {}", full_tag).cyan());
+            eprintln!("  Run '{}' to switch to it.", format!("svm use {}", full_tag).cyan());
         }
     }
 
@@ -1280,9 +1493,10 @@ fn update_version(versions_dir: &Path, svm_dir: &Path) -> Result<()> {
         "svm install latest".cyan()
     ))?;
 
-    // A version file may hold a shorthand like "v1.63.4" — resolve it to the
-    // installed directory name (or normalized tag) before classifying it.
-    let current = resolve_installed_version(&current_raw, versions_dir)
+    // A version file may hold a shorthand like "v1.63.4" or a series/channel
+    // pin like "testnet" — resolve it to the installed directory name (or
+    // normalized tag) before classifying it.
+    let current = resolve_available_version(&current_raw, versions_dir)
         .map(|(name, _)| name)
         .unwrap_or_else(|| normalize_install_tag(&current_raw));
 
@@ -1305,22 +1519,47 @@ fn update_version(versions_dir: &Path, svm_dir: &Path) -> Result<()> {
         latest.green().bold()
     );
 
+    // A series/channel pin ("testnet", "v1.63") resolves to the newest
+    // installed match at shim time — after installing the newer release it
+    // already points at it, so the pin must not be rewritten to a frozen tag.
+    let pin_is_exact = matches!(parse_remote_spec(&current_raw), RemoteSpec::Exact(_));
+
     match source {
         VersionSource::Global => {
-            install_version(&latest, versions_dir, svm_dir, true, true)?;
+            if pin_is_exact {
+                install_version(&latest, versions_dir, svm_dir, true, true)?;
+            } else {
+                install_version(&latest, versions_dir, svm_dir, false, false)?;
+                println!(
+                    "{} Global setting '{}' now resolves to {}.",
+                    "✔".green(),
+                    sanitize_display(&current_raw),
+                    latest.green().bold()
+                );
+            }
         }
         VersionSource::Local(path) => {
             // The active version came from a .svm-version pin: update the pin,
             // not the global default — 'svm update' must take effect where it
             // was run and nowhere else.
             install_version(&latest, versions_dir, svm_dir, false, false)?;
-            fs::write(&path, format!("{}\n", latest))?;
-            println!(
-                "{} Updated pin {} to {}.",
-                "✔".green(),
-                path.display().to_string().blue(),
-                latest.green().bold()
-            );
+            if pin_is_exact {
+                fs::write(&path, format!("{}\n", latest))?;
+                println!(
+                    "{} Updated pin {} to {}.",
+                    "✔".green(),
+                    path.display().to_string().blue(),
+                    latest.green().bold()
+                );
+            } else {
+                println!(
+                    "{} Pin '{}' in {} now resolves to {}.",
+                    "✔".green(),
+                    sanitize_display(&current_raw),
+                    path.display().to_string().blue(),
+                    latest.green().bold()
+                );
+            }
         }
     }
     Ok(())
@@ -1348,6 +1587,36 @@ pub fn resolve_installed_version(version: &str, versions_dir: &Path) -> Option<(
         }
     }
     None
+}
+
+/// Resolve a non-exact spec ("v1.63", "testnet", "latest") against the
+/// *installed* versions: the newest installed patch of a series, or the
+/// newest installed release on a network. This keeps shims working offline
+/// and lets series/channel pins converge instead of re-triggering installs.
+fn resolve_spec_against_installed(spec: &str, versions_dir: &Path) -> Option<(String, PathBuf)> {
+    let (network, series) = match parse_remote_spec(spec) {
+        RemoteSpec::LatestForNetwork(net) => (net, None),
+        RemoteSpec::Partial { network, major, minor } => (network, Some((major, minor))),
+        RemoteSpec::Exact(_) => return None,
+    };
+    let (_, name) = fs::read_dir(versions_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| release_network(name) == Some(network.as_str()))
+        .filter_map(|name| tag_semver(&name).map(|v| (v, name)))
+        .filter(|((major, minor, _), _)| series.is_none_or(|(ma, mi)| *major == ma && *minor == mi))
+        .max_by_key(|(v, _)| *v)?;
+    let path = versions_dir.join(&name);
+    Some((name, path))
+}
+
+/// Resolve a version string to an installed directory: the exact/normalized
+/// name first, then non-exact specs against what is installed. This is the
+/// resolution the shims, `svm which`, and `svm exec` share.
+pub fn resolve_available_version(version: &str, versions_dir: &Path) -> Option<(String, PathBuf)> {
+    resolve_installed_version(version, versions_dir)
+        .or_else(|| resolve_spec_against_installed(version, versions_dir))
 }
 
 pub fn uninstall_version(version: &str, versions_dir: &Path, svm_dir: &Path) -> Result<()> {
@@ -1451,6 +1720,17 @@ fn use_version(version: &str, versions_dir: &Path, bin_dir: &Path, local: bool) 
     Ok(())
 }
 
+/// Source path recorded by `svm link` for a copied build (the sui entry, or
+/// the first entry when sui was not among the linked binaries).
+fn link_source(version_dir: &Path) -> Option<String> {
+    let content = fs::read_to_string(version_dir.join(LINK_MARKER)).ok()?;
+    let line = content
+        .lines()
+        .find(|l| l.starts_with("sui "))
+        .or_else(|| content.lines().next())?;
+    line.split_once(' ').map(|(_, path)| path.to_string())
+}
+
 fn link_local(name: &str, path: Option<&Path>, versions_dir: &Path) -> Result<()> {
     if !valid_version_name(name) {
         return Err(anyhow!(
@@ -1461,15 +1741,18 @@ fn link_local(name: &str, path: Option<&Path>, versions_dir: &Path) -> Result<()
     }
 
     // Refuse to clobber an installed release. Only release-shaped names are
-    // protected — anything else with regular files is a pre-existing linked
-    // build (older svm versions copied binaries) and may be re-linked.
+    // protected; a linked build is recognized by its .svm-link marker or, for
+    // layouts made by older svm versions, by symlinked binaries. Anything
+    // else release-shaped is treated as an installed release — even when the
+    // archive layout hid the binaries — because a re-link now replaces the
+    // whole directory.
     let target_dir = versions_dir.join(name);
-    if target_dir.exists() && release_network(name).is_some() {
-        let has_real_binaries = SVM_BINARIES.iter().any(|bin| {
-            let p = target_dir.join(bin);
-            p.exists() && !p.is_symlink()
-        });
-        if has_real_binaries {
+    if target_dir.exists()
+        && release_network(name).is_some()
+        && !target_dir.join(LINK_MARKER).exists()
+    {
+        let is_legacy_link = SVM_BINARIES.iter().any(|bin| target_dir.join(bin).is_symlink());
+        if !is_legacy_link {
             return Err(anyhow!(
                 "{} '{}' is an installed release, not a linked build.\n{} Pick a different name, or run '{}' first.",
                 "error:".red().bold(),
@@ -1490,11 +1773,23 @@ fn link_local(name: &str, path: Option<&Path>, versions_dir: &Path) -> Result<()
         ],
     };
 
-    // Find each managed binary in the first search dir that has it.
+    // Find each managed binary in the first search dir that has it. Compare
+    // sources against the canonicalized target too — the sources are
+    // canonicalized, and a symlinked $HOME component would otherwise let a
+    // source inside the target slip past and be wiped below.
+    let target_guard = target_dir.canonicalize().unwrap_or_else(|_| target_dir.clone());
     let mut found: Vec<(&str, PathBuf)> = Vec::new();
     for bin in SVM_BINARIES {
         if let Some(src) = search_dirs.iter().map(|d| d.join(bin)).find(|p| p.exists()) {
             let src = src.canonicalize()?;
+            if src.starts_with(&target_guard) || src.starts_with(&target_dir) {
+                return Err(anyhow!(
+                    "{} Source {} is inside the link target {:?}.",
+                    "error:".red().bold(),
+                    src.display().to_string().yellow(),
+                    target_dir
+                ));
+            }
             found.push((bin, src));
         }
     }
@@ -1512,27 +1807,54 @@ fn link_local(name: &str, path: Option<&Path>, versions_dir: &Path) -> Result<()
         ));
     }
 
-    fs::create_dir_all(&target_dir)?;
+    // Copy rather than symlink: a rebuild overwrites the source binaries in
+    // place, and a symlinked version would silently start pointing at a build
+    // the user never registered. The copy stays exactly what was linked until
+    // an explicit re-link refreshes it. Stage first, swap after — a failed
+    // copy must not destroy the previous link (same pattern as unpack_archive).
+    let staging = versions_dir.join(format!(".staging-link-{}-{}", name, std::process::id()));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(&staging)?;
+
+    let result = (|| -> Result<()> {
+        let mut marker = String::new();
+        for (bin, src) in &found {
+            fs::copy(src, staging.join(bin))
+                .with_context(|| format!("Failed to copy {} from {:?}", bin, src))?;
+            marker.push_str(&format!("{} {}\n", bin, src.display()));
+        }
+        fs::write(staging.join(LINK_MARKER), marker)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+
+    if target_dir.exists() {
+        fs::remove_dir_all(&target_dir)
+            .with_context(|| format!("Failed to clear {:?} for re-linking", target_dir))?;
+    }
+    fs::rename(&staging, &target_dir)
+        .with_context(|| format!("Failed to move linked build into {:?}", target_dir))?;
 
     for (bin, src) in &found {
-        let dest = target_dir.join(bin);
-        if dest.exists() || dest.is_symlink() {
-            fs::remove_file(&dest)?;
-        }
-        symlink(src, &dest)?;
         println!(
-            "  {} Linked {} {} {}",
+            "  {} Copied {} {} {}",
             "↳".dimmed(),
             bin.cyan(),
-            "↪".dimmed(),
+            "←".dimmed(),
             src.display().to_string().dimmed()
         );
     }
 
     println!(
-        "{} Local build linked as '{}' — rebuilds are picked up automatically.",
+        "{} Local build copied as '{}' — re-run '{}' after a rebuild to refresh it.",
         "✔".green(),
-        name.green().bold()
+        name.green().bold(),
+        format!("svm link {}", name).cyan()
     );
     Ok(())
 }
@@ -1553,7 +1875,7 @@ pub fn version_sort_key(name: &str) -> (u8, u8, std::cmp::Reverse<(u64, u64, u64
 
 fn list_local(versions_dir: &Path, svm_dir: &Path) -> Result<()> {
     let active = resolve_version(svm_dir)?.map(|(v, _)| {
-        resolve_installed_version(&v, versions_dir)
+        resolve_available_version(&v, versions_dir)
             .map(|(name, _)| name)
             .unwrap_or(v)
     });
@@ -1579,9 +1901,13 @@ fn list_local(versions_dir: &Path, svm_dir: &Path) -> Result<()> {
     println!("{}", "-".repeat(30).dimmed());
 
     for name in names {
-        let link_note = fs::read_link(versions_dir.join(&name).join("sui"))
+        let version_dir = versions_dir.join(&name);
+        // Legacy links show the symlink target; copied links show the
+        // recorded source from their .svm-link marker.
+        let link_note = fs::read_link(version_dir.join("sui"))
             .ok()
             .map(|t| format!(" ↪ {}", t.display()))
+            .or_else(|| link_source(&version_dir).map(|src| format!(" ↪ {} (copy)", src)))
             .unwrap_or_default();
 
         if active.as_deref() == Some(name.as_str()) {
@@ -1719,10 +2045,15 @@ _svm_remote_versions() {
 
     // install should complete with remote versions
     final_script = final_script.replacen("':version:_default'", "':version:_svm_remote_versions'", 1);
-    // use and uninstall should complete with local versions
+    // use, uninstall, and exec should complete with local versions
     final_script = final_script.replace("':version:_default'", "':version:_svm_local_versions'");
     // link name gets no special completion (user picks the name)
     final_script = final_script.replace("':name:_default'", "':name:'");
+    // which completes the managed binary names
+    final_script = final_script.replace(
+        "'::binary:_default'",
+        &format!("'::binary:({})'", SVM_BINARIES.join(" ")),
+    );
 
     final_script
 }

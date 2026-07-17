@@ -204,3 +204,72 @@ fn linked_version_file_contains_exact_name() {
     assert_eq!(tag, "my-dev");
     // Exact name preserved
 }
+
+// --- resolve_available_version: non-exact specs against installed versions ---
+
+#[test]
+fn available_series_spec_picks_newest_installed_patch() {
+    let tmp = TempDir::new().unwrap();
+    let versions = tmp.path().join("versions");
+    fs::create_dir_all(&versions).unwrap();
+    create_version(&versions, "mainnet-v1.63.4");
+    create_version(&versions, "mainnet-v1.63.11");
+    create_version(&versions, "mainnet-v1.64.0");
+    create_version(&versions, "testnet-v1.63.20");
+
+    for spec in ["v1.63", "1.63", "mainnet-v1.63"] {
+        let (name, path) = svm::resolve_available_version(spec, &versions).unwrap();
+        assert_eq!(name, "mainnet-v1.63.11", "spec {spec}");
+        assert_eq!(path, versions.join("mainnet-v1.63.11"));
+    }
+    let (name, _) = svm::resolve_available_version("testnet-v1.63", &versions).unwrap();
+    assert_eq!(name, "testnet-v1.63.20");
+}
+
+#[test]
+fn available_channel_spec_picks_newest_installed_on_network() {
+    let tmp = TempDir::new().unwrap();
+    let versions = tmp.path().join("versions");
+    fs::create_dir_all(&versions).unwrap();
+    create_version(&versions, "mainnet-v1.63.4");
+    create_version(&versions, "mainnet-v1.64.0");
+    create_version(&versions, "testnet-v1.70.1");
+
+    for (spec, expected) in [
+        ("latest", "mainnet-v1.64.0"),
+        ("mainnet", "mainnet-v1.64.0"),
+        ("testnet", "testnet-v1.70.1"),
+        ("testnet-latest", "testnet-v1.70.1"),
+    ] {
+        let (name, _) = svm::resolve_available_version(spec, &versions).unwrap();
+        assert_eq!(name, expected, "spec {spec}");
+    }
+}
+
+#[test]
+fn available_spec_ignores_linked_builds_with_network_substrings() {
+    // A linked build named "testnet-fork" must not satisfy a "testnet" pin
+    let tmp = TempDir::new().unwrap();
+    let versions = tmp.path().join("versions");
+    fs::create_dir_all(&versions).unwrap();
+    create_version(&versions, "testnet-fork");
+    create_version(&versions, "my-testnet-build");
+
+    assert!(svm::resolve_available_version("testnet", &versions).is_none());
+    assert!(svm::resolve_available_version("v1.63", &versions).is_none());
+}
+
+#[test]
+fn available_exact_names_still_resolve_first() {
+    let tmp = TempDir::new().unwrap();
+    let versions = tmp.path().join("versions");
+    fs::create_dir_all(&versions).unwrap();
+    create_version(&versions, "my-dev");
+    create_version(&versions, "mainnet-v1.63.4");
+
+    let (name, _) = svm::resolve_available_version("my-dev", &versions).unwrap();
+    assert_eq!(name, "my-dev");
+    let (name, _) = svm::resolve_available_version("v1.63.4", &versions).unwrap();
+    assert_eq!(name, "mainnet-v1.63.4");
+    assert!(svm::resolve_available_version("nonexistent", &versions).is_none());
+}
