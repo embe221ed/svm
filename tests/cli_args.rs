@@ -233,7 +233,7 @@ fn cli_completions_rejects_unknown_shell() {
 fn cli_install_use_flag() {
     let cli = Cli::try_parse_from(["svm", "install", "--use", "v1.0.0"]).unwrap();
     match cli.command {
-        Commands::Install { version, use_after } => {
+        Commands::Install { version, use_after, .. } => {
             assert_eq!(version, "v1.0.0");
             assert!(use_after);
         }
@@ -245,7 +245,7 @@ fn cli_install_use_flag() {
 fn cli_install_use_short_flag() {
     let cli = Cli::try_parse_from(["svm", "install", "-u", "latest"]).unwrap();
     match cli.command {
-        Commands::Install { version, use_after } => {
+        Commands::Install { version, use_after, .. } => {
             assert_eq!(version, "latest");
             assert!(use_after);
         }
@@ -258,6 +258,39 @@ fn cli_install_default_not_use() {
     let cli = Cli::try_parse_from(["svm", "install", "v1.0.0"]).unwrap();
     match cli.command {
         Commands::Install { use_after, .. } => assert!(!use_after),
+        _ => panic!("wrong command"),
+    }
+}
+
+#[test]
+fn cli_install_full_flag() {
+    let cli = Cli::try_parse_from(["svm", "install", "--full", "v1.0.0"]).unwrap();
+    match cli.command {
+        Commands::Install { version, full, .. } => {
+            assert_eq!(version, "v1.0.0");
+            assert!(full);
+        }
+        _ => panic!("wrong command"),
+    }
+}
+
+#[test]
+fn cli_install_default_not_full() {
+    let cli = Cli::try_parse_from(["svm", "install", "v1.0.0"]).unwrap();
+    match cli.command {
+        Commands::Install { full, .. } => assert!(!full),
+        _ => panic!("wrong command"),
+    }
+}
+
+#[test]
+fn cli_install_full_combines_with_use() {
+    let cli = Cli::try_parse_from(["svm", "install", "--full", "-u", "v1.0.0"]).unwrap();
+    match cli.command {
+        Commands::Install { use_after, full, .. } => {
+            assert!(use_after);
+            assert!(full);
+        }
         _ => panic!("wrong command"),
     }
 }

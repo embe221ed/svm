@@ -71,6 +71,10 @@ pub enum Commands {
         /// Switch to the version after installing
         #[arg(short = 'u', long = "use")]
         use_after: bool,
+        /// Extract every binary in the archive (sui-node, sui-debug, ...),
+        /// not just sui and move-analyzer
+        #[arg(long)]
+        full: bool,
     },
     /// Update the active version to the latest release on its network
     Update,
@@ -189,8 +193,8 @@ pub fn run() -> Result<()> {
         Commands::RemoteList { network, pages, plain, tags_only, cached } => {
             list_remote(network, &svm_dir, pages, plain, tags_only, cached)?
         }
-        Commands::Install { version, use_after } => {
-            install_version(&version, &versions_dir, &svm_dir, use_after, true)?;
+        Commands::Install { version, use_after, full } => {
+            install_version(&version, &versions_dir, &svm_dir, use_after, true, full)?;
         }
         Commands::Update => update_version(&versions_dir, &svm_dir)?,
         Commands::Uninstall { version } => uninstall_version(&version, &versions_dir, &svm_dir)?,
@@ -377,7 +381,7 @@ fn shim_auto_install(
     }
     // Install without activating: the version file that led us here already
     // selects this version, so touching the global default would be wrong.
-    let tag = install_version(version, versions_dir, svm_dir, false, false)?;
+    let tag = install_version(version, versions_dir, svm_dir, false, false, false)?;
     Ok(resolve_installed_version(&tag, versions_dir))
 }
 
@@ -1017,7 +1021,7 @@ fn list_remote(
                 && interactive
                 && prompt_yes_no(&format!("Install {}?", tag.cyan()))?
             {
-                install_version(tag, &versions_dir, svm_dir, false, true)?;
+                install_version(tag, &versions_dir, svm_dir, false, true, false)?;
             }
         }
     }
@@ -1256,11 +1260,52 @@ pub fn verify_sha256(path: &Path, expected: &str) -> Result<bool> {
     Ok(actual == expected.to_lowercase())
 }
 
+/// True when an error chain bottoms out in "no space left on device" (or a
+/// filesystem quota). The archive itself is fine in that case — it must not
+/// be evicted from the cache the way a corrupt one is.
+pub fn is_disk_full_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+            )
+        })
+    })
+}
+
+fn open_archive(archive_path: &Path) -> Result<tar::Archive<flate2::read::GzDecoder<std::io::BufReader<fs::File>>>> {
+    let file = fs::File::open(archive_path)?;
+    Ok(tar::Archive::new(flate2::read::GzDecoder::new(std::io::BufReader::new(file))))
+}
+
+/// Extract only the shim-managed binaries into `staging`. Returns whether
+/// anything matched — an archive with an unrecognized layout extracts nothing
+/// here and the caller falls back to a full unpack.
+fn unpack_managed_only(archive_path: &Path, staging: &Path) -> Result<bool> {
+    let mut archive = open_archive(archive_path)?;
+    let mut matched = false;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let is_managed = entry.path().ok().is_some_and(|p| {
+            p.file_name()
+                .is_some_and(|n| SVM_BINARIES.iter().any(|b| std::ffi::OsStr::new(b) == n))
+        });
+        if is_managed && entry.header().entry_type().is_file() && entry.unpack_in(staging)? {
+            matched = true;
+        }
+    }
+    Ok(matched)
+}
+
 /// Unpack an archive into versions_dir/<full_tag> atomically: extract into a
 /// staging directory first, then rename. A failed unpack never leaves a
 /// half-populated version directory behind. The staging name includes the
 /// pid so concurrent installs of the same tag don't clobber each other.
-pub fn unpack_archive(archive_path: &Path, versions_dir: &Path, full_tag: &str) -> Result<()> {
+///
+/// Unless `full` is set, only the shim-managed binaries are extracted —
+/// release archives also carry sui-node, a multi-GiB sui-debug, etc.
+pub fn unpack_archive(archive_path: &Path, versions_dir: &Path, full_tag: &str, full: bool) -> Result<()> {
     let target_dir = versions_dir.join(full_tag);
     let staging = versions_dir.join(format!(".staging-{}-{}", full_tag, std::process::id()));
     if staging.exists() {
@@ -1269,19 +1314,28 @@ pub fn unpack_archive(archive_path: &Path, versions_dir: &Path, full_tag: &str) 
     fs::create_dir_all(&staging)?;
 
     let result = (|| -> Result<()> {
-        let file = fs::File::open(archive_path)?;
-        let tar = flate2::read::GzDecoder::new(std::io::BufReader::new(file));
-        let mut archive = tar::Archive::new(tar);
-        archive.unpack(&staging)?;
+        if !full && unpack_managed_only(archive_path, &staging)? {
+            return Ok(());
+        }
+        open_archive(archive_path)?.unpack(&staging)?;
         Ok(())
     })();
 
     if let Err(e) = result {
         let _ = fs::remove_dir_all(&staging);
+        if is_disk_full_error(&e) {
+            // The archive is fine — the disk ran out of room mid-extract.
+            return Err(anyhow!(
+                "{} Failed to unpack archive: {:#}\n{} Free up disk space and retry — the verified download is still cached.",
+                "error:".red().bold(),
+                e,
+                "help:".blue().bold()
+            ));
+        }
         // The archive is unusable — drop it from the cache so a retry redownloads.
         let _ = fs::remove_file(archive_path);
         return Err(anyhow!(
-            "{} Failed to unpack archive: {}\n{} The cached archive was removed — retry the install.",
+            "{} Failed to unpack archive: {:#}\n{} The cached archive was removed — retry the install.",
             "error:".red().bold(),
             e,
             "help:".blue().bold()
@@ -1299,6 +1353,7 @@ fn install_version(
     svm_dir: &Path,
     use_after: bool,
     auto_activate: bool,
+    full: bool,
 ) -> Result<String> {
     let full_tag = match parse_remote_spec(spec) {
         RemoteSpec::Exact(tag) => tag,
@@ -1320,6 +1375,12 @@ fn install_version(
     let target_dir = versions_dir.join(&full_tag);
     if target_dir.exists() {
         eprintln!("{} Version {} is already installed.", "ℹ".blue(), full_tag.cyan());
+        if full {
+            eprintln!(
+                "  '--full' does not re-extract an existing install — run '{}' first, then reinstall (the archive stays cached).",
+                format!("svm uninstall {}", full_tag).cyan()
+            );
+        }
         if use_after {
             use_version(&full_tag, versions_dir, &bin_dir, false)?;
         }
@@ -1411,7 +1472,7 @@ fn install_version(
         eprintln!("{} SHA-256 checksum verified.", "✔".green());
     }
 
-    unpack_archive(&archive_path, versions_dir, &full_tag)?;
+    unpack_archive(&archive_path, versions_dir, &full_tag, full)?;
 
     if cfg!(target_os = "macos") {
         let _ = Command::new("xattr")
@@ -1527,9 +1588,9 @@ fn update_version(versions_dir: &Path, svm_dir: &Path) -> Result<()> {
     match source {
         VersionSource::Global => {
             if pin_is_exact {
-                install_version(&latest, versions_dir, svm_dir, true, true)?;
+                install_version(&latest, versions_dir, svm_dir, true, true, false)?;
             } else {
-                install_version(&latest, versions_dir, svm_dir, false, false)?;
+                install_version(&latest, versions_dir, svm_dir, false, false, false)?;
                 println!(
                     "{} Global setting '{}' now resolves to {}.",
                     "✔".green(),
@@ -1542,7 +1603,7 @@ fn update_version(versions_dir: &Path, svm_dir: &Path) -> Result<()> {
             // The active version came from a .svm-version pin: update the pin,
             // not the global default — 'svm update' must take effect where it
             // was run and nowhere else.
-            install_version(&latest, versions_dir, svm_dir, false, false)?;
+            install_version(&latest, versions_dir, svm_dir, false, false, false)?;
             if pin_is_exact {
                 fs::write(&path, format!("{}\n", latest))?;
                 println!(
@@ -1675,7 +1736,7 @@ fn use_version(version: &str, versions_dir: &Path, bin_dir: &Path, local: bool) 
                 ))?
             {
                 let svm_dir = versions_dir.parent().context("versions dir has no parent")?;
-                let tag = install_version(version, versions_dir, svm_dir, false, false)?;
+                let tag = install_version(version, versions_dir, svm_dir, false, false, false)?;
                 resolve_installed_version(&tag, versions_dir)
                     .map(|(resolved, _)| resolved)
                     .ok_or_else(|| anyhow!("Installed {} but could not locate it afterwards", tag))?

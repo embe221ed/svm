@@ -114,7 +114,7 @@ refresh it, so a rebuild can never silently change what a linked version runs.
 | `svm remote-list --tags-only` | Bare tags, one per line, for scripting |
 | `svm remote-list --cached` | Offline: read the local release cache only |
 | `svm remote-list -n testnet -p 5` | Filter by network, fetch up to 5 pages (100 releases each) |
-| `svm install <spec> [--use]` | Install a version, optionally switch to it |
+| `svm install <spec> [--use] [--full]` | Install a version, optionally switch to it (`--full`: extract every binary in the archive, not just `sui` + `move-analyzer`) |
 | `svm update` | Update the active version to its network's latest release (updates the `.svm-version` pin when run in a pinned directory, the global default otherwise) |
 | `svm use <spec> [--local]` | Switch version globally or pin it for the current directory |
 | `svm exec <spec> <cmd...>` | Run one command under a specific installed version, without switching |
@@ -132,8 +132,14 @@ refresh it, so a rebuild can never silently change what a linked version runs.
 
 - Downloads stream to disk (constant memory, even for 1 GB Linux archives) and are
   verified against the **SHA-256 digest GitHub publishes** for each release asset.
+- Release archives ship the whole toolchain (`sui-node`, `sui-tool`, a multi-GiB
+  `sui-debug`, …). By default svm extracts only `sui` and `move-analyzer`, so an
+  install costs a few hundred MiB instead of several GiB. Use `svm install --full`
+  to keep everything — useful with `svm exec <version> sui-tool ...`.
 - Archives unpack into a staging directory and are moved into place atomically — an
-  interrupted or failed install never leaves a half-broken version behind.
+  interrupted or failed install never leaves a half-broken version behind. If the
+  disk fills up mid-unpack, the verified download stays cached so a retry after
+  freeing space doesn't re-download.
 - The release list is cached with ETag revalidation; when GitHub is unreachable or
   rate-limits you, svm falls back to the cached list.
 - Set `GITHUB_TOKEN` to raise API rate limits (useful in CI).

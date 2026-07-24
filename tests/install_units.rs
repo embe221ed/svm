@@ -1,9 +1,9 @@
 use serde_json::json;
 use std::fs;
 use svm::{
-    asset_platform, asset_sha256, completion_script, human_bytes, load_cached_releases,
-    plan_update, uninstall_version, unpack_archive, valid_version_name, verify_sha256,
-    version_sort_key, ReleaseCache,
+    asset_platform, asset_sha256, completion_script, human_bytes, is_disk_full_error,
+    load_cached_releases, plan_update, uninstall_version, unpack_archive, valid_version_name,
+    verify_sha256, version_sort_key, ReleaseCache,
 };
 use tempfile::TempDir;
 
@@ -283,7 +283,7 @@ fn unpack_extracts_atomically_and_cleans_staging() {
     let archive = tmp.path().join("sui-test.tgz");
     fs::write(&archive, make_tgz(&[("sui", b"binary"), ("move-analyzer", b"lsp")])).unwrap();
 
-    unpack_archive(&archive, &versions, "mainnet-v9.9.9").unwrap();
+    unpack_archive(&archive, &versions, "mainnet-v9.9.9", false).unwrap();
 
     let target = versions.join("mainnet-v9.9.9");
     assert_eq!(fs::read(target.join("sui")).unwrap(), b"binary");
@@ -307,9 +307,11 @@ fn unpack_corrupt_archive_leaves_no_target_and_evicts_archive() {
     let archive = tmp.path().join("sui-corrupt.tgz");
     fs::write(&archive, b"this is not a gzip archive").unwrap();
 
-    let result = unpack_archive(&archive, &versions, "mainnet-v9.9.9");
+    let result = unpack_archive(&archive, &versions, "mainnet-v9.9.9", false);
 
-    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    // The root cause must survive into the message, not just "failed to unpack"
+    assert!(err.contains("gzip"), "underlying cause missing from: {err}");
     assert!(!versions.join("mainnet-v9.9.9").exists());
     // Corrupt archive must not stay cached (would fail identically on retry)
     assert!(!archive.exists());
@@ -319,6 +321,108 @@ fn unpack_corrupt_archive_leaves_no_target_and_evicts_archive() {
         .filter(|e| e.file_name().to_string_lossy().starts_with(".staging-"))
         .collect();
     assert!(staging.is_empty());
+}
+
+#[test]
+fn unpack_default_skips_unmanaged_binaries() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let versions = tmp.path().join("versions");
+    fs::create_dir_all(&versions).unwrap();
+    let archive = tmp.path().join("sui-test.tgz");
+    fs::write(
+        &archive,
+        make_tgz(&[
+            ("sui", b"binary"),
+            ("move-analyzer", b"lsp"),
+            ("sui-debug", b"multi-gigabyte debug build"),
+            ("sui-node", b"node"),
+        ]),
+    )
+    .unwrap();
+
+    unpack_archive(&archive, &versions, "mainnet-v9.9.9", false).unwrap();
+
+    let target = versions.join("mainnet-v9.9.9");
+    assert_eq!(fs::read(target.join("sui")).unwrap(), b"binary");
+    assert_eq!(fs::read(target.join("move-analyzer")).unwrap(), b"lsp");
+    assert!(!target.join("sui-debug").exists(), "unmanaged binaries must be skipped");
+    assert!(!target.join("sui-node").exists());
+    // Exec bits survive the selective extraction path too
+    let mode = fs::metadata(target.join("sui")).unwrap().permissions().mode();
+    assert!(mode & 0o111 != 0, "sui must stay executable, mode: {mode:o}");
+}
+
+#[test]
+fn unpack_full_extracts_everything() {
+    let tmp = TempDir::new().unwrap();
+    let versions = tmp.path().join("versions");
+    fs::create_dir_all(&versions).unwrap();
+    let archive = tmp.path().join("sui-test.tgz");
+    fs::write(
+        &archive,
+        make_tgz(&[("sui", b"binary"), ("sui-debug", b"dbg"), ("sui-node", b"node")]),
+    )
+    .unwrap();
+
+    unpack_archive(&archive, &versions, "mainnet-v9.9.9", true).unwrap();
+
+    let target = versions.join("mainnet-v9.9.9");
+    for bin in ["sui", "sui-debug", "sui-node"] {
+        assert!(target.join(bin).exists(), "--full must extract {bin}");
+    }
+}
+
+#[test]
+fn unpack_default_extracts_nested_managed_binaries() {
+    // If the layout ever nests the binaries, the selective path keeps the
+    // entry's relative path — same place a full unpack would put it, so the
+    // top-level-layout warning still applies.
+    let tmp = TempDir::new().unwrap();
+    let versions = tmp.path().join("versions");
+    fs::create_dir_all(&versions).unwrap();
+    let archive = tmp.path().join("sui-test.tgz");
+    fs::write(&archive, make_tgz(&[("nested/sui", b"deep"), ("nested/sui-node", b"skip")])).unwrap();
+
+    unpack_archive(&archive, &versions, "mainnet-v9.9.9", false).unwrap();
+
+    let target = versions.join("mainnet-v9.9.9");
+    assert_eq!(fs::read(target.join("nested/sui")).unwrap(), b"deep");
+    assert!(!target.join("nested/sui-node").exists());
+}
+
+#[test]
+fn unpack_default_falls_back_to_full_for_unknown_layouts() {
+    // No sui/move-analyzer anywhere: extract everything so the install
+    // diagnostics can show what the archive actually contained.
+    let tmp = TempDir::new().unwrap();
+    let versions = tmp.path().join("versions");
+    fs::create_dir_all(&versions).unwrap();
+    let archive = tmp.path().join("sui-test.tgz");
+    fs::write(&archive, make_tgz(&[("bin/tools.txt", b"t"), ("README", b"r")])).unwrap();
+
+    unpack_archive(&archive, &versions, "mainnet-v9.9.9", false).unwrap();
+
+    let target = versions.join("mainnet-v9.9.9");
+    assert!(target.join("bin/tools.txt").exists());
+    assert!(target.join("README").exists());
+}
+
+// --- is_disk_full_error (cache retention on ENOSPC) ---
+
+#[test]
+fn disk_full_errors_are_detected_through_the_chain() {
+    // Mirrors the shape tar produces: an outer context wrapping the io error
+    let enospc = std::io::Error::from(std::io::ErrorKind::StorageFull);
+    let err = anyhow::Error::from(enospc).context("failed to unpack `sui-debug`");
+    assert!(is_disk_full_error(&err));
+
+    let quota = std::io::Error::from(std::io::ErrorKind::QuotaExceeded);
+    assert!(is_disk_full_error(&anyhow::Error::from(quota)));
+
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let err = anyhow::Error::from(denied).context("failed to unpack `sui`");
+    assert!(!is_disk_full_error(&err), "only disk-space errors keep the cached archive");
 }
 
 // --- load_cached_releases ---
