@@ -177,9 +177,16 @@ fn etag_304_returns_cached_data() {
         .match_header("If-None-Match", "\"my-etag\"")
         .with_status(304)
         .create();
+    let second_page = server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(2))
+        .with_body(serde_json::to_string(&make_releases(200)[100..]).unwrap())
+        .expect(1)
+        .create();
 
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 2).unwrap();
     assert_eq!(result.len(), 200);
+    second_page.assert();
 }
 
 #[test]
@@ -229,6 +236,12 @@ fn etag_304_truncate_when_cache_has_fewer_than_page_boundary() {
         .with_status(304)
         .expect_at_least(1)
         .create();
+    let second_page = server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(2))
+        .with_body(serde_json::to_string(&make_releases(150)[100..]).unwrap())
+        .expect(1)
+        .create();
 
     // limit=100, cache has 150 -> 100
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 1).unwrap();
@@ -237,6 +250,200 @@ fn etag_304_truncate_when_cache_has_fewer_than_page_boundary() {
     // limit=200, cache has 150 -> 150
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 2).unwrap();
     assert_eq!(result.len(), 150);
+    second_page.assert();
+}
+
+#[test]
+fn unchanged_first_page_refreshes_edited_older_release_metadata_within_page_limit() {
+    let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
+    let original = make_releases(300);
+    write_cache(
+        tmp.path(),
+        &url,
+        &ReleaseCache {
+            etag: Some("\"same-first-page\"".into()),
+            pages: 3,
+            releases: original.clone(),
+        },
+    );
+    let first_page = server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .match_header("if-none-match", "\"same-first-page\"")
+        .with_status(304)
+        .expect(1)
+        .create();
+    let mut edited = original[100..200].to_vec();
+    edited[0]["assets"] = json!([{"name": "newly-published-archive.tgz"}]);
+    let second_page = server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(2))
+        .with_body(serde_json::to_vec(&edited).unwrap())
+        .expect(1)
+        .create();
+    let third_page = server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(3))
+        .expect(0)
+        .create();
+    let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 2).unwrap();
+    let expected = [original[..100].to_vec(), edited].concat();
+    assert_eq!(
+        result, expected,
+        "an unchanged first page must not hide changes to older releases"
+    );
+    let saved = read_cache(tmp.path()).unwrap();
+    assert_eq!(saved.releases, expected);
+    assert_eq!(saved.pages, 2);
+    assert_eq!(saved.etag.as_deref(), Some("\"same-first-page\""));
+    first_page.assert();
+    second_page.assert();
+    third_page.assert();
+}
+
+#[test]
+fn unchanged_first_page_later_failure_preserves_complete_original_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
+    let original = make_releases(300);
+    write_cache(
+        tmp.path(),
+        &url,
+        &ReleaseCache {
+            etag: Some("\"same-first-page\"".into()),
+            pages: 3,
+            releases: original.clone(),
+        },
+    );
+    server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .with_status(304)
+        .create();
+    let mut edited = original[100..200].to_vec();
+    edited[0]["assets"] = json!([{"name": "new-asset"}]);
+    let second_page = server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(2))
+        .with_body(serde_json::to_vec(&edited).unwrap())
+        .expect(1)
+        .create();
+    let third_page = server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(3))
+        .with_status(503)
+        .expect(1)
+        .create();
+    let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 3).unwrap();
+    assert_eq!(
+        result, original,
+        "fresh and stale pages must not be combined after a failure"
+    );
+    assert_eq!(read_cache(tmp.path()).unwrap().releases, original);
+    second_page.assert();
+    third_page.assert();
+}
+
+#[test]
+fn unchanged_short_first_page_needs_no_later_requests() {
+    let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
+    let original = make_releases(50);
+    write_cache(
+        tmp.path(),
+        &url,
+        &ReleaseCache {
+            etag: Some("\"short-first-page\"".into()),
+            pages: 3,
+            releases: original.clone(),
+        },
+    );
+    server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .with_status(304)
+        .create();
+    let second_page = server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(2))
+        .expect(0)
+        .create();
+    assert_eq!(
+        fetch_releases_impl(&test_client(), &url, tmp.path(), 3).unwrap(),
+        original
+    );
+    second_page.assert();
+}
+
+#[test]
+fn unchanged_first_page_short_later_page_removes_stale_tail_and_stops_fetching() {
+    let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
+    let original = make_releases(300);
+    write_cache(
+        tmp.path(),
+        &url,
+        &ReleaseCache {
+            etag: Some("\"same-first-page\"".into()),
+            pages: 3,
+            releases: original.clone(),
+        },
+    );
+    server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .with_status(304)
+        .create();
+    let second_page = server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(2))
+        .with_body(serde_json::to_vec(&original[100..125]).unwrap())
+        .expect(1)
+        .create();
+    let third_page = server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(3))
+        .expect(0)
+        .create();
+    let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 3).unwrap();
+    assert_eq!(result, original[..125]);
+    assert_eq!(read_cache(tmp.path()).unwrap().releases, result);
+    second_page.assert();
+    third_page.assert();
+}
+
+#[test]
+fn zero_requested_pages_does_not_fetch_or_change_cache() {
+    let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
+    let original = make_releases(200);
+    write_cache(
+        tmp.path(),
+        &url,
+        &ReleaseCache {
+            etag: Some("\"existing\"".into()),
+            pages: 2,
+            releases: original.clone(),
+        },
+    );
+    let request = server
+        .mock("GET", "/releases")
+        .match_query(Matcher::Any)
+        .expect(0)
+        .create();
+    assert!(
+        fetch_releases_impl(&test_client(), &url, tmp.path(), 0)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(read_cache(tmp.path()).unwrap().releases, original);
+    request.assert();
 }
 
 #[test]
@@ -514,7 +721,7 @@ fn network_error_no_cache_returns_error() {
 // --- Cache write protection ---
 
 #[test]
-fn empty_response_does_not_overwrite_cache() {
+fn empty_success_replaces_stale_release_snapshot_and_etag() {
     let tmp = TempDir::new().unwrap();
     let mut server = Server::new();
     let url = format!("{}/releases", server.url());
@@ -531,15 +738,49 @@ fn empty_response_does_not_overwrite_cache() {
         .with_status(200)
         .with_header("etag", "\"empty\"")
         .with_body("[]")
-        .expect_at_least(1)
+        .expect(1)
         .create();
 
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 1).unwrap();
     assert_eq!(result.len(), 0);
 
     let saved = read_cache(tmp.path()).unwrap();
-    assert_eq!(saved.releases.len(), 50);
-    assert_eq!(saved.etag, Some("\"e\"".into()));
+    assert!(saved.releases.is_empty());
+    assert_eq!(saved.etag, Some("\"empty\"".into()));
+    let revalidation = server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .match_header("if-none-match", "\"empty\"")
+        .with_status(304)
+        .expect(1)
+        .create();
+    assert!(
+        fetch_releases_impl(&test_client(), &url, tmp.path(), 1)
+            .unwrap()
+            .is_empty()
+    );
+    revalidation.assert();
+}
+
+#[test]
+fn fresh_empty_success_creates_empty_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
+    server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .with_body("[]")
+        .create();
+    assert!(
+        fetch_releases_impl(&test_client(), &url, tmp.path(), 1)
+            .unwrap()
+            .is_empty()
+    );
+    let saved = read_cache(tmp.path()).expect("successful empty data should be available offline");
+    assert!(saved.releases.is_empty());
+    assert_eq!(saved.pages, 1);
+    assert!(saved.etag.is_none());
 }
 
 #[test]

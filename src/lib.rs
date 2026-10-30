@@ -173,6 +173,7 @@ fn strip_leading_ansi(s: &str) -> &str {
 /// cloned repo would otherwise let the shim execute an arbitrary binary.
 pub fn valid_version_name(name: &str) -> bool {
     !name.is_empty()
+        && name.trim() == name
         && !name.starts_with(['.', '-'])
         && !name.contains('/')
         && !name.contains('\\')
@@ -208,6 +209,20 @@ pub fn run() -> Result<()> {
     fs::create_dir_all(&versions_dir)?;
     fs::create_dir_all(&bin_dir)?;
 
+    // Acquire once at mutation entrypoints. Helpers such as install -> use
+    // deliberately reuse this guard rather than acquiring a nested file lock.
+    // Read-only commands and cached shell completion never wait for downloads.
+    let _mutation_lock = match &cli.command {
+        Commands::Install { .. }
+        | Commands::Update
+        | Commands::Uninstall { .. }
+        | Commands::Use { .. }
+        | Commands::Link { .. }
+        | Commands::Unset
+        | Commands::Cache { action: Some(_) } => Some(lock_mutations(&svm_dir)?),
+        _ => None,
+    };
+
     match cli.command {
         Commands::RemoteList {
             network,
@@ -240,6 +255,44 @@ pub fn run() -> Result<()> {
 }
 
 // --- Version file resolution ---
+
+/// Coordinate all CLI/shim mutations through a persistent file outside cache
+/// and versions. Never remove this file: replacing it could let two processes
+/// lock different inodes. File closure (including process exit) releases it.
+fn lock_mutations(svm_dir: &Path) -> Result<fs::File> {
+    fs::create_dir_all(svm_dir)?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(svm_dir.join("mutation.lock"))
+        .context("Could not open svm mutation lock")?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
+            eprintln!(
+                "{} Waiting for another svm operation to finish...",
+                "info:".blue()
+            );
+            file.lock().context("Could not acquire svm mutation lock")?;
+        }
+        Err(fs::TryLockError::Error(err)) => {
+            return Err(err).context("Could not acquire svm mutation lock");
+        }
+    }
+    Ok(file)
+}
+
+fn write_version_file(path: &Path, version: &str) -> Result<()> {
+    use std::io::Write;
+    let mut file =
+        tempfile::NamedTempFile::new_in(path.parent().context("Version file has no parent")?)?;
+    writeln!(file, "{}", version)?;
+    file.persist(path)
+        .with_context(|| format!("Could not save version file {}", path.display()))?;
+    Ok(())
+}
 
 fn read_version_file(path: &Path) -> Result<Option<String>> {
     let content = fs::read_to_string(path)?;
@@ -405,6 +458,12 @@ fn shim_auto_install(
     }
     // Install without activating: the version file that led us here already
     // selects this version, so touching the global default would be wrong.
+    let _mutation_lock = lock_mutations(svm_dir)?;
+    // Another install may have completed while this shim waited. Reuse it
+    // without contacting the API or touching the archive a second time.
+    if let Some(found) = resolve_available_version(version, versions_dir) {
+        return Ok(Some(found));
+    }
     let tag = install_version(version, versions_dir, svm_dir, false, false, false)?;
     Ok(resolve_installed_version(&tag, versions_dir))
 }
@@ -668,6 +727,9 @@ pub fn fetch_releases_impl(
     svm_dir: &Path,
     max_pages: u32,
 ) -> Result<Vec<serde_json::Value>> {
+    if max_pages == 0 {
+        return Ok(Vec::new());
+    }
     let cache = cache_dir(svm_dir)?;
     let cache_file = cache.join("releases.json");
     let limit = (max_pages as usize) * 100;
@@ -691,7 +753,16 @@ pub fn fetch_releases_impl(
             .send()
         {
             Ok(resp) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {
-                return Ok(cached.releases[..limit.min(cached.releases.len())].to_vec());
+                // This validator covers page 1 only. Older releases can be
+                // edited, added or deleted while page 1 remains unchanged.
+                // Reuse its validated data and refetch all later requested
+                // pages; any failure below falls back to the whole snapshot.
+                if max_pages == 1 || cached.releases.len() < 100 {
+                    return Ok(cached.releases[..limit.min(cached.releases.len())].to_vec());
+                }
+                all_releases.extend_from_slice(&cached.releases[..100]);
+                new_etag = cached.etag.clone();
+                start_page = 2;
             }
             Ok(resp) if resp.status().is_success() => {
                 // ETag changed — cache is stale. Reuse this response as
@@ -783,30 +854,27 @@ pub fn fetch_releases_impl(
         }
     }
 
-    // Only update cache if we got results
-    if !all_releases.is_empty() {
-        let new_cache = SourcedReleaseCache {
-            cache: ReleaseCache {
-                etag: new_etag,
-                pages: max_pages,
-                releases: all_releases,
-            },
-            source: Some(base_url.to_string()),
-        };
-        // Write beside the destination and atomically replace it. Readers
-        // never observe truncated JSON, including during concurrent refreshes.
-        // Cache persistence is best effort; a read-only/full disk must not
-        // discard successfully fetched release data.
-        let _ = (|| -> Result<()> {
-            let mut file = tempfile::NamedTempFile::new_in(&cache)?;
-            serde_json::to_writer(file.as_file_mut(), &new_cache)?;
-            file.persist(&cache_file)?;
-            Ok(())
-        })();
-        return Ok(new_cache.cache.releases);
-    }
-
-    Ok(all_releases)
+    // A successful empty response is authoritative too: retain it instead
+    // of resurrecting removed releases in offline browsing or completion.
+    let new_cache = SourcedReleaseCache {
+        cache: ReleaseCache {
+            etag: new_etag,
+            pages: max_pages,
+            releases: all_releases,
+        },
+        source: Some(base_url.to_string()),
+    };
+    // Write beside the destination and atomically replace it. Readers
+    // never observe truncated JSON, including during concurrent refreshes.
+    // Cache persistence is best effort; a read-only/full disk must not
+    // discard successfully fetched release data.
+    let _ = (|| -> Result<()> {
+        let mut file = tempfile::NamedTempFile::new_in(&cache)?;
+        serde_json::to_writer(file.as_file_mut(), &new_cache)?;
+        file.persist(&cache_file)?;
+        Ok(())
+    })();
+    Ok(new_cache.cache.releases)
 }
 
 // --- Release asset lookup (existence check + sha256 digest) ---
@@ -885,12 +953,15 @@ pub const COLORS_OFF: Colors = Colors {
     bold: "",
 };
 
-/// Colors only when stdout is a terminal and NO_COLOR is unset.
-fn detect_colors() -> &'static Colors {
-    if std::env::var_os("NO_COLOR").is_none()
+fn colors_enabled() -> bool {
+    std::env::var_os("NO_COLOR").is_none()
         && !std::env::var("TERM").is_ok_and(|term| term == "dumb")
-        && std::io::stdout().is_terminal()
-    {
+        && colored::control::SHOULD_COLORIZE.should_colorize()
+}
+
+/// Use the same terminal/environment policy as ordinary styled messages.
+fn detect_colors() -> &'static Colors {
+    if colors_enabled() && std::io::stdout().is_terminal() {
         &COLORS_ON
     } else {
         &COLORS_OFF
@@ -1103,6 +1174,7 @@ fn list_remote(
         if !installed.iter().any(|i| i == tag)
             && prompt_yes_no(&format!("Install {}?", tag.cyan()))?
         {
+            let _mutation_lock = lock_mutations(svm_dir)?;
             install_version(tag, &versions_dir, svm_dir, false, true, false)?;
         }
     }
@@ -1155,9 +1227,7 @@ fn picker_command(mut command: Command, rows: &[String], header: &str) -> Result
         .stdin(Stdio::from(input))
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    if std::env::var_os("NO_COLOR").is_some()
-        || std::env::var("TERM").is_ok_and(|term| term == "dumb")
-    {
+    if !colors_enabled() {
         command.arg("--color=bw");
     } else {
         command.arg("--color=prompt:blue,pointer:cyan,hl:blue,hl+:cyan,header:gray");
@@ -1224,6 +1294,7 @@ fn interactive_mode(versions_dir: &Path, svm_dir: &Path, bin_dir: &Path) -> Resu
                 "Set global default | Enter to confirm | Esc to cancel"
             };
             if let Some(index) = fuzzy_pick(&versions, header)? {
+                let _mutation_lock = lock_mutations(svm_dir)?;
                 use_version(&versions[index], versions_dir, bin_dir, local)?;
             }
         }
@@ -1527,8 +1598,8 @@ fn unpack_managed_only(archive_path: &Path, staging: &Path) -> Result<bool> {
 
 /// Unpack an archive into versions_dir/<full_tag> atomically: extract into a
 /// staging directory first, then rename. A failed unpack never leaves a
-/// half-populated version directory behind. The staging name includes the
-/// pid so concurrent installs of the same tag don't clobber each other.
+/// half-populated version directory behind. Every call gets unique staging,
+/// including simultaneous library calls from threads in the same process.
 ///
 /// Unless `full` is set, only the shim-managed binaries are extracted —
 /// release archives also carry sui-node, a multi-GiB sui-debug, etc.
@@ -1538,23 +1609,21 @@ pub fn unpack_archive(
     full_tag: &str,
     full: bool,
 ) -> Result<()> {
+    fs::create_dir_all(versions_dir)?;
     let target_dir = versions_dir.join(full_tag);
-    let staging = versions_dir.join(format!(".staging-{}-{}", full_tag, std::process::id()));
-    if staging.exists() {
-        fs::remove_dir_all(&staging)?;
-    }
-    fs::create_dir_all(&staging)?;
+    let staging = tempfile::Builder::new()
+        .prefix(&format!(".staging-{}-", full_tag))
+        .tempdir_in(versions_dir)?;
 
     let result = (|| -> Result<()> {
-        if !full && unpack_managed_only(archive_path, &staging)? {
+        if !full && unpack_managed_only(archive_path, staging.path())? {
             return Ok(());
         }
-        open_archive(archive_path)?.unpack(&staging)?;
+        open_archive(archive_path)?.unpack(staging.path())?;
         Ok(())
     })();
 
     if let Err(e) = result {
-        let _ = fs::remove_dir_all(&staging);
         if is_disk_full_error(&e) {
             // The archive is fine — the disk ran out of room mid-extract.
             return Err(anyhow!(
@@ -1574,7 +1643,7 @@ pub fn unpack_archive(
         ));
     }
 
-    fs::rename(&staging, &target_dir)
+    fs::rename(staging.path(), &target_dir)
         .with_context(|| format!("Failed to move unpacked files into {:?}", target_dir))?;
     Ok(())
 }
@@ -1896,7 +1965,7 @@ fn update_version(versions_dir: &Path, svm_dir: &Path) -> Result<()> {
             // was run and nowhere else.
             install_version(&latest, versions_dir, svm_dir, false, false, false)?;
             if pin_is_exact {
-                fs::write(&path, format!("{}\n", latest))?;
+                write_version_file(&path, &latest)?;
                 println!(
                     "{} Updated pin {} to {}.",
                     "✔".green(),
@@ -2084,7 +2153,7 @@ fn use_version(version: &str, versions_dir: &Path, bin_dir: &Path, local: bool) 
     if local {
         let cwd = std::env::current_dir()?;
         let version_file = cwd.join(".svm-version");
-        fs::write(&version_file, format!("{}\n", pin))?;
+        write_version_file(&version_file, pin)?;
         println!(
             "{} Set local version to {} in {}",
             "✔".green(),
@@ -2095,7 +2164,7 @@ fn use_version(version: &str, versions_dir: &Path, bin_dir: &Path, local: bool) 
         let svm_dir = versions_dir
             .parent()
             .context("versions dir has no parent")?;
-        fs::write(svm_dir.join("version"), format!("{}\n", pin))?;
+        write_version_file(&svm_dir.join("version"), pin)?;
         println!(
             "{} Active version set to: {}",
             "✔".green(),
@@ -2104,12 +2173,14 @@ fn use_version(version: &str, versions_dir: &Path, bin_dir: &Path, local: bool) 
     }
 
     let current_exe = std::env::current_exe()?;
+    let shims = tempfile::Builder::new()
+        .prefix(".staging-shims-")
+        .tempdir_in(bin_dir)?;
     for bin in SVM_BINARIES {
         let shim_path = bin_dir.join(bin);
-        if shim_path.exists() || shim_path.is_symlink() {
-            fs::remove_file(&shim_path)?;
-        }
-        symlink(&current_exe, &shim_path)?;
+        let staged = shims.path().join(bin);
+        symlink(&current_exe, &staged)?;
+        fs::rename(&staged, &shim_path)?;
     }
 
     warn_if_shims_not_on_path(bin_dir);
@@ -2130,9 +2201,9 @@ fn link_source(version_dir: &Path) -> Option<String> {
 fn link_local(name: &str, path: Option<&Path>, versions_dir: &Path) -> Result<()> {
     if !valid_version_name(name) {
         return Err(anyhow!(
-            "{} Invalid link name: {} (must be a plain name without '/' and not starting with '.')",
+            "{} Invalid link name: {} (use a plain name without path separators, control characters or surrounding whitespace; do not start with '.' or '-')",
             "error:".red().bold(),
-            name.yellow()
+            sanitize_display(name).yellow()
         ));
     }
 
@@ -2212,32 +2283,27 @@ fn link_local(name: &str, path: Option<&Path>, versions_dir: &Path) -> Result<()
     // the user never registered. The copy stays exactly what was linked until
     // an explicit re-link refreshes it. Stage first, swap after — a failed
     // copy must not destroy the previous link (same pattern as unpack_archive).
-    let staging = versions_dir.join(format!(".staging-link-{}-{}", name, std::process::id()));
-    if staging.exists() {
-        fs::remove_dir_all(&staging)?;
-    }
-    fs::create_dir_all(&staging)?;
+    let staging = tempfile::Builder::new()
+        .prefix(&format!(".staging-link-{}-", name))
+        .tempdir_in(versions_dir)?;
 
     let result = (|| -> Result<()> {
         let mut marker = String::new();
         for (bin, src) in &found {
-            fs::copy(src, staging.join(bin))
+            fs::copy(src, staging.path().join(bin))
                 .with_context(|| format!("Failed to copy {} from {:?}", bin, src))?;
             marker.push_str(&format!("{} {}\n", bin, src.display()));
         }
-        fs::write(staging.join(LINK_MARKER), marker)?;
+        fs::write(staging.path().join(LINK_MARKER), marker)?;
         Ok(())
     })();
-    if let Err(e) = result {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(e);
-    }
+    result?;
 
     if target_dir.exists() {
         fs::remove_dir_all(&target_dir)
             .with_context(|| format!("Failed to clear {:?} for re-linking", target_dir))?;
     }
-    fs::rename(&staging, &target_dir)
+    fs::rename(staging.path(), &target_dir)
         .with_context(|| format!("Failed to move linked build into {:?}", target_dir))?;
 
     for (bin, src) in &found {
@@ -2438,7 +2504,12 @@ pub fn completion_script(shell: Shell) -> String {
 _svm_local_versions() {
     setopt localoptions no_glob_dots
     local -a versions
-    versions=("$HOME"/.svm/versions/*(N/:t))
+    local entry version
+    for entry in "$HOME"/.svm/versions/*(N/); do
+        version=${entry:t}
+        [[ $version != [.-]* && $version != *\\* && $version != *[[:cntrl:]]* && $version != [[:space:]]* && $version != *[[:space:]] ]] || continue
+        versions+=("$version")
+    done
     compadd -X 'installed versions' -a versions
 }
 _svm_remote_versions() {
@@ -2463,10 +2534,54 @@ _svm_remote_versions() {
 }
 
 const BASH_DYNAMIC_COMPLETIONS: &str = r#"
+# Decode the current command without eval or shell expansion. COMP_WORDS keeps
+# quotes/backslashes and splits names at ':' and '=' with Bash's defaults.
+_svm_completion_words() {
+    local LC_ALL=C
+    local text="${COMP_LINE:0:COMP_POINT}" word= quote= escaped= active= char i
+    svm_words=()
+    svm_trim=
+    for ((i=0; i<${#text}; i++)); do
+        char=${text:i:1}
+        if [[ -n $escaped ]]; then
+            word+=$char
+            escaped=
+        elif [[ $quote == "'" ]]; then
+            if [[ $char == "'" ]]; then quote=; else word+=$char; fi
+        elif [[ $char == '\' ]]; then
+            escaped=1
+            active=1
+        elif [[ -n $quote ]]; then
+            if [[ $char == '"' ]]; then quote=; else word+=$char; fi
+        elif [[ $char == "'" || $char == '"' ]]; then
+            quote=$char
+            active=1
+        elif [[ $char == ' ' || $char == $'\t' || $char == $'\n' ]]; then
+            if [[ -n $active ]]; then svm_words+=("$word"); fi
+            word= active= svm_trim=
+        else
+            word+=$char
+            active=1
+            if [[ ( $char == : || $char == = ) && $COMP_WORDBREAKS == *"$char"* ]]; then
+                svm_trim=$word
+            fi
+        fi
+    done
+    svm_words+=("$word")
+}
+
 # Keep clap's option/subcommand completion and add versions at their argument.
 _svm_dynamic() {
-    local cur="${COMP_WORDS[COMP_CWORD]}" sub="${COMP_WORDS[1]}" i item path
-    if [[ $COMP_CWORD -lt 2 || $cur == -* ]]; then
+    local -a svm_words
+    local svm_trim= cur sub i item path
+    if [[ -n ${COMP_LINE+x} ]]; then
+        _svm_completion_words
+    else
+        svm_words=("${COMP_WORDS[@]:0:COMP_CWORD+1}")
+    fi
+    cur=${svm_words[${#svm_words[@]}-1]}
+    sub=${svm_words[1]}
+    if [[ ${#svm_words[@]} -lt 3 || $cur == -* ]]; then
         _svm "$@"
         return
     fi
@@ -2476,8 +2591,8 @@ _svm_dynamic() {
     esac
     # These commands' options take no values. Once a positional argument has
     # been supplied, leave subsequent arguments to clap (especially exec).
-    for ((i=2; i<COMP_CWORD; i++)); do
-        if [[ ${COMP_WORDS[i]} != -* ]]; then
+    for ((i=2; i<${#svm_words[@]}-1; i++)); do
+        if [[ ${svm_words[i]} != -* ]]; then
             _svm "$@"
             return
         fi
@@ -2485,18 +2600,18 @@ _svm_dynamic() {
     COMPREPLY=()
     if [[ $sub == install ]]; then
         while IFS= read -r item; do
-            [[ -n $item && $item == "$cur"* ]] && COMPREPLY+=("$item")
+            [[ -n $item && $item == "$cur"* ]] && COMPREPLY+=("${item#"$svm_trim"}")
         done < <(printf '%s\n' latest mainnet testnet devnet; command svm remote-list --tags-only --cached 2>/dev/null)
     elif [[ $sub == which ]]; then
         for item in sui move-analyzer; do
-            [[ $item == "$cur"* ]] && COMPREPLY+=("$item")
+            [[ $item == "$cur"* ]] && COMPREPLY+=("${item#"$svm_trim"}")
         done
     else
         for path in "$HOME"/.svm/versions/*; do
             [[ -d $path ]] || continue
             item=${path##*/}
-            [[ $item != .* ]] || continue
-            [[ $item == "$cur"* ]] && COMPREPLY+=("$item")
+            [[ $item != [.-]* && $item != *\\* && $item != *[[:cntrl:]]* && $item != [[:space:]]* && $item != *[[:space:]] ]] || continue
+            [[ $item == "$cur"* ]] && COMPREPLY+=("${item#"$svm_trim"}")
         done
     fi
 }
@@ -2510,8 +2625,11 @@ fi
 const FISH_DYNAMIC_COMPLETIONS: &str = r#"
 function __svm_local_versions
     for path in "$HOME"/.svm/versions/*
-        if test -d "$path"
-            string replace -r '^.*/' '' -- "$path"
+        if test -d "$path"; and not string match -rq -- '[[:cntrl:]]' "$path"
+            set -l candidate (string replace -r '^.*/' '' -- "$path")
+            if not string match -rq -- '^[.-]|^[[:space:]]|[[:space:]]$|[[:cntrl:]\\\\]' "$candidate"
+                printf '%s\n' "$candidate"
+            end
         end
     end
 end

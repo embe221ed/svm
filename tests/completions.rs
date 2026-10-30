@@ -23,6 +23,8 @@ fn shell_available(shell: &str) -> bool {
     available
 }
 
+const HOME_COMPONENT: &str = "home with spaces '\" []:$";
+
 struct Fixture {
     tmp: TempDir,
 }
@@ -30,7 +32,7 @@ struct Fixture {
 impl Fixture {
     fn new(shell: Shell) -> Self {
         let tmp = TempDir::new().unwrap();
-        let home = tmp.path().join("home with spaces");
+        let home = tmp.path().join(HOME_COMPONENT);
         let versions = home.join(".svm/versions");
         fs::create_dir_all(&versions).unwrap();
         for name in ["mainnet-v1.2.3", "my fork", "fork:debug", ".staging-test"] {
@@ -50,6 +52,10 @@ if [ -n "$CACHED_TAG" ]; then printf '%s\n' "$CACHED_TAG"; fi"#,
     }
 
     fn run(&self, shell: &str, body: &str, cached_tag: &str) -> String {
+        self.run_with(shell, body, cached_tag, &[])
+    }
+
+    fn run_with(&self, shell: &str, body: &str, cached_tag: &str, vars: &[(&str, &str)]) -> String {
         let mut cmd = Command::new(shell);
         if shell == "bash" {
             cmd.args(["--noprofile", "--norc", "-c"]);
@@ -60,7 +66,8 @@ if [ -n "$CACHED_TAG" ]; then printf '%s\n' "$CACHED_TAG"; fi"#,
         }
         let output = cmd
             .arg(body)
-            .env("HOME", self.tmp.path().join("home with spaces"))
+            .envs(vars.iter().copied())
+            .env("HOME", self.tmp.path().join(HOME_COMPONENT))
             .env("COMPLETION_SCRIPT", self.tmp.path().join("completion"))
             .env("CALL_LOG", self.tmp.path().join("calls"))
             .env("CACHED_TAG", cached_tag)
@@ -80,6 +87,19 @@ if [ -n "$CACHED_TAG" ]; then printf '%s\n' "$CACHED_TAG"; fi"#,
             String::from_utf8_lossy(&output.stderr)
         );
         stdout_str(&output)
+    }
+
+    fn add_versions(&self, names: &[&str]) {
+        for name in names {
+            fs::create_dir(
+                self.tmp
+                    .path()
+                    .join(HOME_COMPONENT)
+                    .join(".svm/versions")
+                    .join(name),
+            )
+            .unwrap();
+        }
     }
 
     fn calls(&self) -> String {
@@ -242,4 +262,98 @@ complete -C 'svm exec mainnet-v1.2.3 my'"#,
             .lines()
             .all(|line| line == "remote-list --tags-only --cached")
     );
+}
+
+#[test]
+fn bash_registered_completion_decodes_quotes_escapes_and_word_breaks() {
+    let f = Fixture::new(Shell::Bash);
+    f.add_versions(&["fork=debug", "single'quote", "double\"quote", "débogue"]);
+    let body = r#"source "$COMPLETION_SCRIPT"
+registered=$(complete -p svm)
+entrypoint=${registered##* -F }
+entrypoint=${entrypoint%% *}
+COMP_WORDS=(svm use '')
+COMP_CWORD=2
+COMP_LINE=$QUERY
+COMP_POINT=$QUERY_POINT
+"$entrypoint" svm '' use
+printf '%s\n' "${COMPREPLY[@]}""#;
+    for (query, expected) in [
+        ("svm use fork:d", "debug\n"),
+        ("svm use fork=", "debug\n"),
+        ("svm use \"my f", "my fork\n"),
+        ("svm use my\\ f", "my fork\n"),
+        ("svm use 'my f", "my fork\n"),
+        ("svm use single\\'", "single'quote\n"),
+        ("svm use double\\\"", "double\"quote\n"),
+        ("svm use dé", "débogue\n"),
+        ("svm use 'fork:d", "fork:debug\n"),
+        ("svm use fork\\:d", "fork:debug\n"),
+    ] {
+        assert_eq!(
+            f.run_with(
+                "bash",
+                body,
+                "",
+                &[("QUERY", query), ("QUERY_POINT", &query.len().to_string())]
+            ),
+            expected,
+            "{query}"
+        );
+    }
+    assert!(f.calls().is_empty());
+}
+
+#[test]
+fn installed_completion_candidates_follow_version_name_validation() {
+    for shell in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+        let executable = shell.to_string();
+        if !shell_available(&executable) {
+            continue;
+        }
+        let f = Fixture::new(shell);
+        f.add_versions(&[
+            "-invalid",
+            " leading",
+            "trailing ",
+            "tab\tname",
+            "line\nname",
+            "back\\slash",
+            "double\"quote",
+            "single'quote",
+        ]);
+        let body = match shell {
+            Shell::Bash => {
+                r#"source "$COMPLETION_SCRIPT"
+COMP_WORDS=(svm use '')
+COMP_CWORD=2
+_svm_dynamic svm '' use
+printf '%s\n' "${COMPREPLY[@]}""#
+            }
+            Shell::Zsh => {
+                r#"compdef() { :; }
+compadd() { local name=$argv[-1]; print -rl -- "${(@P)name}"; }
+source "$COMPLETION_SCRIPT"
+_svm_local_versions"#
+            }
+            Shell::Fish => {
+                r#"source "$COMPLETION_SCRIPT"
+complete -C 'svm use '"#
+            }
+            _ => unreachable!(),
+        };
+        let result = f.run(&executable, body, "");
+        let candidates: Vec<_> = result.lines().collect();
+        assert_eq!(
+            candidates,
+            [
+                "double\"quote",
+                "fork:debug",
+                "mainnet-v1.2.3",
+                "my fork",
+                "single'quote"
+            ],
+            "{shell}"
+        );
+    }
 }

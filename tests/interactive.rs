@@ -73,3 +73,29 @@ fn completion_generation_does_not_initialize_home() {
     assert!(stdout_str(&out).contains("_svm_dynamic"));
     assert!(!home.svm_dir().exists());
 }
+
+#[test]
+fn cached_release_output_ignores_invalid_terminal_tags() {
+    let home = TestHome::new();
+    let cache = home.svm_dir().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let releases = serde_json::json!({
+        "source": svm::GITHUB_API, "etag": null, "pages": 1,
+        "releases": [
+            {"tag_name": "mainnet-v1.2.3"},
+            {"tag_name": "bad\nextra-row"},
+            {"tag_name": "bad\u{1b}[31m"},
+            {"tag_name": "../outside"},
+            {"tag_name": ""}
+        ]
+    });
+    std::fs::write(cache.join("releases.json"), releases.to_string()).unwrap();
+    let out = home
+        .svm()
+        .args(["remote-list", "--cached", "--tags-only"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(stdout_str(&out), "mainnet-v1.2.3\n");
+    assert!(stderr_str(&out).is_empty());
+}

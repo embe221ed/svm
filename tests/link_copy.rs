@@ -315,3 +315,32 @@ fn linked_build_runs_through_use_and_shim_end_to_end() {
         h.versions_dir().join("my-fork/sui").display().to_string()
     );
 }
+
+#[test]
+fn link_rejects_outer_whitespace_but_preserves_spaces_inside_names() {
+    let home = TestHome::new();
+    let source = home.home().join("build");
+    fs::create_dir(&source).unwrap();
+    write_exec_script(&source.join("sui"), "echo linked-with-spaces");
+    for name in [" my fork", "my fork ", "\u{a0}my fork", "my fork\u{2003}"] {
+        let out = home
+            .svm()
+            .args(["link", name, source.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "must reject {name:?}");
+        assert!(stderr_str(&out).contains("Invalid link name"));
+        assert!(!home.versions_dir().join(name).exists());
+    }
+    let out = home
+        .svm()
+        .args(["link", "my fork", source.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr_str(&out));
+    let out = home.svm().args(["use", "my fork"]).output().unwrap();
+    assert!(out.status.success(), "{}", stderr_str(&out));
+    let out = home.shim("sui").output().unwrap();
+    assert!(out.status.success(), "{}", stderr_str(&out));
+    assert_eq!(stdout_str(&out).trim(), "linked-with-spaces");
+}

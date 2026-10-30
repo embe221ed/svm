@@ -212,6 +212,7 @@ manages many tools (walrus, mvr, seal, …). `svm` is deliberately smaller — j
 
 ## Requirements
 
+- Rust 1.89 or newer to build from source
 - macOS or Linux (x86_64 / ARM)
 - [`fzf`](https://github.com/junegunn/fzf) (optional) for `svm interactive` and the `remote-list` picker
 
@@ -224,9 +225,18 @@ cargo fmt --all -- --check
 cargo check --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 SVM_REQUIRE_SHELL_TESTS=1 cargo test --locked --all-targets
+SVM_REQUIRE_PTY_TESTS=1 python3 tests/terminal_workflows.py
+SVM_REQUIRE_PTY_TESTS=1 python3 tests/bash_completion_pty.py
 ```
 
 The full shell suite requires bash, zsh and fish. Without
 `SVM_REQUIRE_SHELL_TESTS`, tests for unavailable optional shells are skipped.
 CI installs these shells and runs the suite on Linux and macOS. Network tests
 use local mock servers; they do not download real Sui releases.
+
+Terminal workflow tests use Python 3's standard library and a real `fzf` in a
+pseudo-terminal. They cover switching, pinning, cancellation, missing-fzf
+fallback, redirected input, narrow windows and color settings. Set
+`SVM_TEST_BINARY` to test a binary outside `target/debug/svm`.
+The Bash tests press Tab and Enter in a real shell, then verify the exact
+arguments received, including quoted names and shell word-break characters.
