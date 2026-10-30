@@ -6,11 +6,11 @@ Install prebuilt releases, switch between them globally or per-project, and link
 
 ```console
 $ svm install latest
-⬇ Downloading mainnet-v1.74.1...
+info: Downloading mainnet-v1.74.1...
 ✔ Downloaded 360.3 MiB.
 ✔ SHA-256 checksum verified.
 ✔ Successfully installed mainnet-v1.74.1
-✨ Active version set to: mainnet-v1.74.1
+✔ Active version set to: mainnet-v1.74.1
 
 $ sui --version
 sui 1.74.1-8fc60f1fa966
@@ -39,6 +39,7 @@ svm install testnet       # newest testnet release
 svm install v1.63         # newest 1.63.x patch on mainnet
 svm install v1.63.4 --use # exact version, switch to it immediately
 svm use testnet-v1.74.1   # switch (offers to install if missing)
+svm interactive           # guided fuzzy menu (requires fzf)
 svm list                  # what's installed, active one marked
 svm update                # move the active version to its network's latest
 ```
@@ -121,6 +122,7 @@ refresh it, so a rebuild can never silently change what a linked version runs.
 | `svm which [binary]` | Print the full path the shim resolves to (default: `sui`) |
 | `svm uninstall <spec>` | Remove a version (clears the global setting if it was active) |
 | `svm link <name> [path]` | Register a local build as a switchable version (copies the binaries) |
+| `svm interactive` | Guided menu to switch globally, pin locally, browse/install releases and inspect state |
 | `svm list` | Installed versions, grouped by network, newest first |
 | `svm show` | Active version and where it's set from |
 | `svm unset` | Remove shims and the global version |
@@ -140,7 +142,7 @@ refresh it, so a rebuild can never silently change what a linked version runs.
   interrupted or failed install never leaves a half-broken version behind. If the
   disk fills up mid-unpack, the verified download stays cached so a retry after
   freeing space doesn't re-download.
-- The release list is cached with ETag revalidation; when GitHub is unreachable or
+- The release list is cached per API source with ETag revalidation; when GitHub is unreachable or
   rate-limits you, svm falls back to the cached list.
 - Set `GITHUB_TOKEN` to raise API rate limits (useful in CI).
 - `SVM_API_BASE` / `SVM_DOWNLOAD_BASE` override the GitHub endpoints (mirrors,
@@ -148,13 +150,16 @@ refresh it, so a rebuild can never silently change what a linked version runs.
   publishes, so only mirror the API from a source you trust. `GITHUB_TOKEN` is
   **not** sent when these overrides are active — it never leaves github.com.
 
+Cache updates and downloads are published atomically. Connection attempts time out
+after 10 seconds; stalled requests or reads time out after 30 seconds.
+
 Downloaded archives stay in `~/.svm/cache` so reinstalls are instant; run
 `svm cache clean` when you want the disk back.
 
 ## Shell completions
 
 ```sh
-# zsh (with dynamic version completion for install/use/uninstall)
+# zsh (offline dynamic version completion)
 svm completions zsh > ~/.zfunc/_svm
 
 # bash
@@ -163,6 +168,23 @@ svm completions bash > /usr/local/etc/bash_completion.d/svm
 # fish
 svm completions fish > ~/.config/fish/completions/svm.fish
 ```
+
+Completions for zsh, bash and fish use installed versions and the local release
+cache, so pressing Tab never waits for the network. Run `svm remote-list --plain`
+to refresh remote suggestions. Regenerate your completion file after upgrading.
+
+## Interactive use and terminal output
+
+Run `svm interactive` to choose a common action, then search installed versions
+or browse releases. Type to filter, use arrow keys to move, Enter to select, and
+Esc or Ctrl-C to cancel. The menu performs one action and exits. Global switching
+leaves project pins in effect; choose the local pin action to change this directory.
+`svm remote-list` also opens a fuzzy picker in a terminal, with a confirmation
+before installing a selected release. Without fzf it prints a table.
+
+Piped output stays plain; `--tags-only` prints bare release tags for scripts.
+Set `NO_COLOR=1` to disable colors. `TERM=dumb` also disables colors. Success uses
+a green checkmark; other messages use simple `info:`, `warning:` and `error:` labels.
 
 ## How it compares to suiup
 
@@ -191,4 +213,20 @@ manages many tools (walrus, mvr, seal, …). `svm` is deliberately smaller — j
 ## Requirements
 
 - macOS or Linux (x86_64 / ARM)
-- [`fzf`](https://github.com/junegunn/fzf) (optional) for the interactive `remote-list` picker
+- [`fzf`](https://github.com/junegunn/fzf) (optional) for `svm interactive` and the `remote-list` picker
+
+## Development
+
+Run the same checks as CI:
+
+```sh
+cargo fmt --all -- --check
+cargo check --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+SVM_REQUIRE_SHELL_TESTS=1 cargo test --locked --all-targets
+```
+
+The full shell suite requires bash, zsh and fish. Without
+`SVM_REQUIRE_SHELL_TESTS`, tests for unavailable optional shells are skipped.
+CI installs these shells and runs the suite on Linux and macOS. Network tests
+use local mock servers; they do not download real Sui releases.

@@ -2,7 +2,7 @@ use mockito::{Matcher, Server};
 use serde_json::json;
 use std::fs;
 use std::path::Path;
-use svm::{fetch_release_assets, fetch_releases_impl, ReleaseCache, ReleaseLookup};
+use svm::{ReleaseCache, ReleaseLookup, fetch_release_assets, fetch_releases_impl};
 use tempfile::TempDir;
 
 fn make_releases(n: usize) -> Vec<serde_json::Value> {
@@ -11,12 +11,14 @@ fn make_releases(n: usize) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn write_cache(svm_dir: &Path, cache: &ReleaseCache) {
+fn write_cache(svm_dir: &Path, source: &str, cache: &ReleaseCache) {
     let cache_dir = svm_dir.join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
+    let mut stored = serde_json::to_value(cache).unwrap();
+    stored["source"] = json!(source);
     fs::write(
         cache_dir.join("releases.json"),
-        serde_json::to_string(cache).unwrap(),
+        serde_json::to_string(&stored).unwrap(),
     )
     .unwrap();
 }
@@ -157,8 +159,11 @@ fn fresh_fetch_multi_page_stops_on_partial_last_page() {
 #[test]
 fn etag_304_returns_cached_data() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: Some("\"my-etag\"".into()),
             pages: 2,
@@ -166,7 +171,6 @@ fn etag_304_returns_cached_data() {
         },
     );
 
-    let mut server = Server::new();
     server
         .mock("GET", "/releases")
         .match_query(page_matcher(1))
@@ -174,7 +178,6 @@ fn etag_304_returns_cached_data() {
         .with_status(304)
         .create();
 
-    let url = format!("{}/releases", server.url());
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 2).unwrap();
     assert_eq!(result.len(), 200);
 }
@@ -182,8 +185,11 @@ fn etag_304_returns_cached_data() {
 #[test]
 fn etag_304_truncates_to_requested_pages() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: Some("\"e\"".into()),
             pages: 3,
@@ -191,14 +197,12 @@ fn etag_304_truncates_to_requested_pages() {
         },
     );
 
-    let mut server = Server::new();
     server
         .mock("GET", "/releases")
         .match_query(page_matcher(1))
         .with_status(304)
         .create();
 
-    let url = format!("{}/releases", server.url());
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 1).unwrap();
     assert_eq!(result.len(), 100);
 }
@@ -206,9 +210,12 @@ fn etag_304_truncates_to_requested_pages() {
 #[test]
 fn etag_304_truncate_when_cache_has_fewer_than_page_boundary() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     // Cache says 2 pages but only has 150 releases (page 2 was partial)
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: Some("\"e\"".into()),
             pages: 2,
@@ -216,7 +223,6 @@ fn etag_304_truncate_when_cache_has_fewer_than_page_boundary() {
         },
     );
 
-    let mut server = Server::new();
     server
         .mock("GET", "/releases")
         .match_query(page_matcher(1))
@@ -224,7 +230,6 @@ fn etag_304_truncate_when_cache_has_fewer_than_page_boundary() {
         .expect_at_least(1)
         .create();
 
-    let url = format!("{}/releases", server.url());
     // limit=100, cache has 150 -> 100
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 1).unwrap();
     assert_eq!(result.len(), 100);
@@ -237,8 +242,11 @@ fn etag_304_truncate_when_cache_has_fewer_than_page_boundary() {
 #[test]
 fn etag_changed_triggers_full_refetch() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: Some("\"old-etag\"".into()),
             pages: 1,
@@ -246,7 +254,6 @@ fn etag_changed_triggers_full_refetch() {
         },
     );
 
-    let mut server = Server::new();
     let new_releases = make_releases(75);
 
     server
@@ -258,7 +265,6 @@ fn etag_changed_triggers_full_refetch() {
         .expect(1) // ETag check response is reused as page 1 — no second request
         .create();
 
-    let url = format!("{}/releases", server.url());
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 1).unwrap();
     assert_eq!(result.len(), 75);
 
@@ -270,8 +276,11 @@ fn etag_changed_triggers_full_refetch() {
 #[test]
 fn etag_changed_multi_page_reuses_first_response_and_continues() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: Some("\"old\"".into()),
             pages: 2,
@@ -279,7 +288,6 @@ fn etag_changed_multi_page_reuses_first_response_and_continues() {
         },
     );
 
-    let mut server = Server::new();
     // Page 1: served once for the ETag check, reused as refetch page 1
     server
         .mock("GET", "/releases")
@@ -298,7 +306,6 @@ fn etag_changed_multi_page_reuses_first_response_and_continues() {
         .expect(1)
         .create();
 
-    let url = format!("{}/releases", server.url());
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 2).unwrap();
     assert_eq!(result.len(), 160);
 
@@ -311,8 +318,11 @@ fn etag_changed_multi_page_reuses_first_response_and_continues() {
 fn etag_changed_short_first_page_stops_pagination() {
     // Reused page 1 has < 100 items → no page 2 request even with max_pages=3
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: Some("\"old\"".into()),
             pages: 3,
@@ -320,7 +330,6 @@ fn etag_changed_short_first_page_stops_pagination() {
         },
     );
 
-    let mut server = Server::new();
     server
         .mock("GET", "/releases")
         .match_query(page_matcher(1))
@@ -336,7 +345,6 @@ fn etag_changed_short_first_page_stops_pagination() {
         .expect(0)
         .create();
 
-    let url = format!("{}/releases", server.url());
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 3).unwrap();
     assert_eq!(result.len(), 40);
     m2.assert();
@@ -347,16 +355,17 @@ fn etag_changed_short_first_page_stops_pagination() {
 #[test]
 fn cache_fewer_pages_bypasses_etag_and_fetches() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: Some("\"e\"".into()),
             pages: 1,
             releases: make_releases(100),
         },
     );
-
-    let mut server = Server::new();
 
     server
         .mock("GET", "/releases")
@@ -373,7 +382,6 @@ fn cache_fewer_pages_bypasses_etag_and_fetches() {
         .with_body(serde_json::to_string(&make_releases(40)).unwrap())
         .create();
 
-    let url = format!("{}/releases", server.url());
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 2).unwrap();
     assert_eq!(result.len(), 140);
 
@@ -384,8 +392,11 @@ fn cache_fewer_pages_bypasses_etag_and_fetches() {
 #[test]
 fn no_etag_in_cache_does_full_fetch() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: None,
             pages: 2,
@@ -393,7 +404,6 @@ fn no_etag_in_cache_does_full_fetch() {
         },
     );
 
-    let mut server = Server::new();
     server
         .mock("GET", "/releases")
         .match_query(page_matcher(1))
@@ -402,7 +412,6 @@ fn no_etag_in_cache_does_full_fetch() {
         .with_body(serde_json::to_string(&make_releases(20)).unwrap())
         .create();
 
-    let url = format!("{}/releases", server.url());
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 1).unwrap();
     assert_eq!(result.len(), 20);
 }
@@ -412,8 +421,11 @@ fn no_etag_in_cache_does_full_fetch() {
 #[test]
 fn api_error_with_cache_falls_back() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: None,
             pages: 1,
@@ -421,7 +433,6 @@ fn api_error_with_cache_falls_back() {
         },
     );
 
-    let mut server = Server::new();
     server
         .mock("GET", "/releases")
         .match_query(page_matcher(1))
@@ -429,7 +440,6 @@ fn api_error_with_cache_falls_back() {
         .with_body("rate limited")
         .create();
 
-    let url = format!("{}/releases", server.url());
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 1).unwrap();
     assert_eq!(result.len(), 80);
 }
@@ -437,8 +447,11 @@ fn api_error_with_cache_falls_back() {
 #[test]
 fn api_error_with_cache_truncates_to_requested_pages() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: None,
             pages: 2,
@@ -446,14 +459,12 @@ fn api_error_with_cache_truncates_to_requested_pages() {
         },
     );
 
-    let mut server = Server::new();
     server
         .mock("GET", "/releases")
         .match_query(page_matcher(1))
         .with_status(403)
         .create();
 
-    let url = format!("{}/releases", server.url());
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 1).unwrap();
     assert_eq!(result.len(), 100);
 }
@@ -477,8 +488,10 @@ fn api_error_no_cache_returns_error() {
 #[test]
 fn network_error_with_cache_falls_back_truncated() {
     let tmp = TempDir::new().unwrap();
+    let url = "http://127.0.0.1:1/releases";
     write_cache(
         tmp.path(),
+        url,
         &ReleaseCache {
             etag: Some("\"e\"".into()),
             pages: 3,
@@ -486,7 +499,6 @@ fn network_error_with_cache_falls_back_truncated() {
         },
     );
 
-    let url = "http://127.0.0.1:1/releases";
     let result = fetch_releases_impl(&test_client(), url, tmp.path(), 2).unwrap();
     assert_eq!(result.len(), 200);
 }
@@ -504,14 +516,15 @@ fn network_error_no_cache_returns_error() {
 #[test]
 fn empty_response_does_not_overwrite_cache() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     let original = ReleaseCache {
         etag: Some("\"e\"".into()),
         pages: 1,
         releases: make_releases(50),
     };
-    write_cache(tmp.path(), &original);
+    write_cache(tmp.path(), &url, &original);
 
-    let mut server = Server::new();
     server
         .mock("GET", "/releases")
         .match_query(page_matcher(1))
@@ -521,7 +534,6 @@ fn empty_response_does_not_overwrite_cache() {
         .expect_at_least(1)
         .create();
 
-    let url = format!("{}/releases", server.url());
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 1).unwrap();
     assert_eq!(result.len(), 0);
 
@@ -611,12 +623,13 @@ fn network_error_on_page_2_discards_partial_data_and_errors() {
 }
 
 #[test]
-fn api_error_on_page_2_with_existing_cache_does_not_fallback() {
-    // Fallback to cache only happens on page 1 failure.
-    // Page 2+ failure is a hard error even if cache exists.
+fn api_error_on_page_2_falls_back_to_entire_existing_snapshot() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: None,
             pages: 2,
@@ -624,14 +637,15 @@ fn api_error_on_page_2_with_existing_cache_does_not_fallback() {
         },
     );
 
-    let mut server = Server::new();
-
+    let fresh = json!({"tag_name": "mainnet-v9.9.9"});
+    let mut page1 = make_releases(100);
+    page1[0] = fresh.clone();
     server
         .mock("GET", "/releases")
         .match_query(page_matcher(1))
         .with_status(200)
         .with_header("etag", "\"e\"")
-        .with_body(serde_json::to_string(&make_releases(100)).unwrap())
+        .with_body(serde_json::to_string(&page1).unwrap())
         .create();
 
     server
@@ -640,10 +654,13 @@ fn api_error_on_page_2_with_existing_cache_does_not_fallback() {
         .with_status(500)
         .create();
 
-    let url = format!("{}/releases", server.url());
-    let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 2);
-    // Does NOT fall back to cache — page 2+ errors are hard failures
-    assert!(result.is_err());
+    let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 2).unwrap();
+    assert_eq!(result, make_releases(200));
+    assert!(
+        !result.contains(&fresh),
+        "never combine fresh and stale pages"
+    );
+    assert_eq!(read_cache(tmp.path()).unwrap().releases, result);
 }
 
 // --- Boundary: exactly 100 items ---
@@ -742,8 +759,11 @@ fn server_returns_no_etag_header_caches_with_none() {
 #[test]
 fn cache_with_pages_zero_treated_as_insufficient() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: Some("\"e\"".into()),
             pages: 0,
@@ -751,7 +771,6 @@ fn cache_with_pages_zero_treated_as_insufficient() {
         },
     );
 
-    let mut server = Server::new();
     server
         .mock("GET", "/releases")
         .match_query(page_matcher(1))
@@ -760,7 +779,6 @@ fn cache_with_pages_zero_treated_as_insufficient() {
         .with_body(serde_json::to_string(&make_releases(15)).unwrap())
         .create();
 
-    let url = format!("{}/releases", server.url());
     // pages=0 < max_pages=1, so ETag path is skipped, full fetch happens
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 1).unwrap();
     assert_eq!(result.len(), 15);
@@ -771,8 +789,11 @@ fn cache_with_pages_zero_treated_as_insufficient() {
 #[test]
 fn fresh_fetch_overwrites_stale_cache() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: None,
             pages: 1,
@@ -780,7 +801,6 @@ fn fresh_fetch_overwrites_stale_cache() {
         },
     );
 
-    let mut server = Server::new();
     server
         .mock("GET", "/releases")
         .match_query(page_matcher(1))
@@ -789,7 +809,6 @@ fn fresh_fetch_overwrites_stale_cache() {
         .with_body(serde_json::to_string(&make_releases(75)).unwrap())
         .create();
 
-    let url = format!("{}/releases", server.url());
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 1).unwrap();
     assert_eq!(result.len(), 75);
 
@@ -802,8 +821,11 @@ fn fresh_fetch_overwrites_stale_cache() {
 #[test]
 fn refetch_with_more_pages_updates_cache_page_count() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: None,
             pages: 1,
@@ -811,7 +833,6 @@ fn refetch_with_more_pages_updates_cache_page_count() {
         },
     );
 
-    let mut server = Server::new();
     server
         .mock("GET", "/releases")
         .match_query(page_matcher(1))
@@ -827,7 +848,6 @@ fn refetch_with_more_pages_updates_cache_page_count() {
         .with_body(serde_json::to_string(&make_releases(50)).unwrap())
         .create();
 
-    let url = format!("{}/releases", server.url());
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 2).unwrap();
     assert_eq!(result.len(), 150);
 
@@ -920,8 +940,11 @@ fn release_lookup_garbled_body_is_unavailable() {
 #[test]
 fn bad_page1_body_falls_back_to_cache() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: None,
             pages: 1,
@@ -929,7 +952,6 @@ fn bad_page1_body_falls_back_to_cache() {
         },
     );
 
-    let mut server = Server::new();
     server
         .mock("GET", "/releases")
         .match_query(page_matcher(1))
@@ -937,7 +959,6 @@ fn bad_page1_body_falls_back_to_cache() {
         .with_body("<html>proxy error page</html>")
         .create();
 
-    let url = format!("{}/releases", server.url());
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 1).unwrap();
     assert_eq!(result.len(), 70);
 }
@@ -945,8 +966,11 @@ fn bad_page1_body_falls_back_to_cache() {
 #[test]
 fn bad_etag_refresh_body_falls_back_to_cache() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: Some("\"old\"".into()),
             pages: 1,
@@ -954,7 +978,6 @@ fn bad_etag_refresh_body_falls_back_to_cache() {
         },
     );
 
-    let mut server = Server::new();
     server
         .mock("GET", "/releases")
         .match_query(page_matcher(1))
@@ -963,7 +986,6 @@ fn bad_etag_refresh_body_falls_back_to_cache() {
         .with_body("garbled")
         .create();
 
-    let url = format!("{}/releases", server.url());
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 1).unwrap();
     assert_eq!(result.len(), 50);
 }
@@ -971,8 +993,11 @@ fn bad_etag_refresh_body_falls_back_to_cache() {
 #[test]
 fn etag_check_returns_403_falls_back_to_cache() {
     let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
     write_cache(
         tmp.path(),
+        &url,
         &ReleaseCache {
             etag: Some("\"e\"".into()),
             pages: 1,
@@ -980,15 +1005,197 @@ fn etag_check_returns_403_falls_back_to_cache() {
         },
     );
 
-    let mut server = Server::new();
     server
         .mock("GET", "/releases")
         .match_query(page_matcher(1))
         .with_status(403)
         .create();
 
-    let url = format!("{}/releases", server.url());
     let result = fetch_releases_impl(&test_client(), &url, tmp.path(), 1).unwrap();
     // The wildcard arm in the ETag match catches non-2xx non-304 and falls back
     assert_eq!(result.len(), 80);
+}
+
+#[test]
+fn changing_api_source_does_not_reuse_metadata_or_etag() {
+    let tmp = TempDir::new().unwrap();
+    let mut first = Server::new();
+    let mut second = Server::new();
+    let first_url = format!("{}/releases", first.url());
+    let second_url = format!("{}/releases", second.url());
+    let original = make_releases(2);
+    first
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .with_header("etag", "\"first-source\"")
+        .with_body(serde_json::to_string(&original).unwrap())
+        .create();
+    fetch_releases_impl(&test_client(), &first_url, tmp.path(), 1).unwrap();
+
+    let replacement = vec![json!({"tag_name": "testnet-v9.9.9"})];
+    let request = second
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .match_header("if-none-match", Matcher::Missing)
+        .with_body(serde_json::to_string(&replacement).unwrap())
+        .expect(1)
+        .create();
+    let result = fetch_releases_impl(&test_client(), &second_url, tmp.path(), 1).unwrap();
+    assert_eq!(result, replacement);
+    request.assert();
+
+    let stored: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(tmp.path().join("cache/releases.json")).unwrap())
+            .unwrap();
+    assert_eq!(stored["source"], second_url);
+}
+
+#[test]
+fn failed_new_source_never_falls_back_to_previous_source() {
+    let tmp = TempDir::new().unwrap();
+    let mut first = Server::new();
+    let mut second = Server::new();
+    first
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .with_header("etag", "\"first-source\"")
+        .with_body(serde_json::to_string(&make_releases(2)).unwrap())
+        .create();
+    fetch_releases_impl(
+        &test_client(),
+        &format!("{}/releases", first.url()),
+        tmp.path(),
+        1,
+    )
+    .unwrap();
+    second
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .with_status(503)
+        .create();
+    let result = fetch_releases_impl(
+        &test_client(),
+        &format!("{}/releases", second.url()),
+        tmp.path(),
+        1,
+    );
+    assert!(result.is_err());
+    assert_eq!(read_cache(tmp.path()).unwrap().releases, make_releases(2));
+}
+
+#[test]
+fn legacy_unsourced_cache_is_never_sent_or_used_for_custom_api() {
+    let tmp = TempDir::new().unwrap();
+    let cache_dir = tmp.path().join("cache");
+    fs::create_dir(&cache_dir).unwrap();
+    let legacy = ReleaseCache {
+        etag: Some("\"official-api-etag\"".into()),
+        pages: 1,
+        releases: make_releases(2),
+    };
+    fs::write(
+        cache_dir.join("releases.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    let mut server = Server::new();
+    let request = server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .match_header("if-none-match", Matcher::Missing)
+        .with_status(503)
+        .expect(1)
+        .create();
+    let result = fetch_releases_impl(
+        &test_client(),
+        &format!("{}/releases", server.url()),
+        tmp.path(),
+        1,
+    );
+    assert!(
+        result.is_err(),
+        "mirror failures must not return unsourced metadata"
+    );
+    request.assert();
+    assert_eq!(read_cache(tmp.path()).unwrap().releases, legacy.releases);
+}
+
+#[test]
+fn cache_refresh_keeps_existing_readers_on_complete_snapshot() {
+    use std::io::Read;
+
+    let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
+    write_cache(
+        tmp.path(),
+        &url,
+        &ReleaseCache {
+            etag: None,
+            pages: 1,
+            releases: make_releases(5),
+        },
+    );
+    let cache_path = tmp.path().join("cache/releases.json");
+    // A reader opened before replacement must retain its complete old file,
+    // while readers opened after replacement see the complete new file.
+    let mut existing_reader = fs::File::open(&cache_path).unwrap();
+    server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .with_body(serde_json::to_string(&make_releases(10)).unwrap())
+        .create();
+    fetch_releases_impl(
+        &test_client(),
+        &format!("{}/releases", server.url()),
+        tmp.path(),
+        1,
+    )
+    .unwrap();
+    let mut old_contents = String::new();
+    existing_reader.read_to_string(&mut old_contents).unwrap();
+    assert_eq!(
+        serde_json::from_str::<ReleaseCache>(&old_contents)
+            .unwrap()
+            .releases
+            .len(),
+        5
+    );
+    assert_eq!(read_cache(tmp.path()).unwrap().releases.len(), 10);
+    assert_eq!(fs::read_dir(tmp.path().join("cache")).unwrap().count(), 1);
+}
+
+#[test]
+fn malformed_later_page_falls_back_without_overwriting_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    let mut server = Server::new();
+    let url = format!("{}/releases", server.url());
+    write_cache(
+        tmp.path(),
+        &url,
+        &ReleaseCache {
+            etag: None,
+            pages: 2,
+            releases: make_releases(150),
+        },
+    );
+    server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(1))
+        .with_body(serde_json::to_string(&make_releases(100)).unwrap())
+        .create();
+    server
+        .mock("GET", "/releases")
+        .match_query(page_matcher(2))
+        .with_body("{truncated")
+        .create();
+    let result = fetch_releases_impl(
+        &test_client(),
+        &format!("{}/releases", server.url()),
+        tmp.path(),
+        2,
+    )
+    .unwrap();
+    assert_eq!(result, make_releases(150));
+    assert_eq!(read_cache(tmp.path()).unwrap().releases, result);
 }

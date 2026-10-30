@@ -50,8 +50,15 @@ fn shim_auto_install_disabled_by_falsy_env() {
     let h = TestHome::new();
     h.set_global_version("mainnet-v9.9.9");
     for value in ["0", "false", "no", "n", "off"] {
-        let out = h.shim("sui").env("SVM_AUTO_INSTALL", value).output().unwrap();
-        assert!(!out.status.success(), "SVM_AUTO_INSTALL={value} must not install");
+        let out = h
+            .shim("sui")
+            .env("SVM_AUTO_INSTALL", value)
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "SVM_AUTO_INSTALL={value} must not install"
+        );
         assert!(stderr_str(&out).contains("is set but not installed"));
     }
 }
@@ -83,7 +90,11 @@ fn shim_auto_install_truthy_values_attempt_install() {
 fn shim_auto_install_unrecognized_value_declines_when_not_interactive() {
     let h = TestHome::new();
     h.set_global_version("mainnet-v9.9.9");
-    let out = h.shim("sui").env("SVM_AUTO_INSTALL", "maybe").output().unwrap();
+    let out = h
+        .shim("sui")
+        .env("SVM_AUTO_INSTALL", "maybe")
+        .output()
+        .unwrap();
     assert!(!out.status.success());
     let err = stderr_str(&out);
     assert!(err.contains("is set but not installed"));
@@ -293,5 +304,8 @@ fn shim_auto_install_checksum_mismatch_fails_and_installs_nothing() {
 
     assert!(!out.status.success());
     assert!(stderr_str(&out).contains("SHA-256 verification failed"));
-    assert!(!h.versions_dir().join(tag).exists(), "nothing must be installed");
+    assert!(
+        !h.versions_dir().join(tag).exists(),
+        "nothing must be installed"
+    );
 }

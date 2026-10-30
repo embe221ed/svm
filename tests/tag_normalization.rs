@@ -7,18 +7,12 @@ fn bare_version_gets_mainnet_prefix() {
 
 #[test]
 fn mainnet_tag_unchanged() {
-    assert_eq!(
-        normalize_install_tag("mainnet-v1.63.4"),
-        "mainnet-v1.63.4"
-    );
+    assert_eq!(normalize_install_tag("mainnet-v1.63.4"), "mainnet-v1.63.4");
 }
 
 #[test]
 fn testnet_tag_unchanged() {
-    assert_eq!(
-        normalize_install_tag("testnet-v1.63.4"),
-        "testnet-v1.63.4"
-    );
+    assert_eq!(normalize_install_tag("testnet-v1.63.4"), "testnet-v1.63.4");
 }
 
 #[test]

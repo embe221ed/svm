@@ -273,3 +273,43 @@ fn available_exact_names_still_resolve_first() {
     assert_eq!(name, "mainnet-v1.63.4");
     assert!(svm::resolve_available_version("nonexistent", &versions).is_none());
 }
+
+#[test]
+fn resolution_ignores_files_named_like_versions() {
+    let tmp = TempDir::new().unwrap();
+    let versions = tmp.path().join("versions");
+    fs::create_dir_all(&versions).unwrap();
+    create_version(&versions, "mainnet-v1.63.3");
+    fs::write(versions.join("mainnet-v1.63.99"), "stray file").unwrap();
+    fs::write(versions.join("mainnet-v1.64.0"), "stray file").unwrap();
+    fs::write(versions.join("my-dev"), "stray file").unwrap();
+
+    for spec in ["mainnet-v1.63.99", "v1.63.99", "my-dev"] {
+        assert!(
+            svm::resolve_available_version(spec, &versions).is_none(),
+            "{spec}"
+        );
+    }
+    for spec in ["v1.63", "latest", "mainnet"] {
+        let (name, _) = svm::resolve_available_version(spec, &versions).unwrap();
+        assert_eq!(name, "mainnet-v1.63.3", "spec {spec}");
+    }
+}
+
+#[test]
+fn version_names_reject_terminal_controls_and_option_prefixes() {
+    for name in [
+        "my\nbuild",
+        "my\tbuild",
+        "my\rbuild",
+        "my\x1b[31mbuild",
+        "-dev",
+        "--help",
+        "my\0build",
+    ] {
+        assert!(!svm::valid_version_name(name), "must reject {name:?}");
+    }
+    for name in ["my-dev", "sui.2026", "release candidate"] {
+        assert!(svm::valid_version_name(name), "should accept {name:?}");
+    }
+}

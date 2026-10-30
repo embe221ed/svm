@@ -233,7 +233,9 @@ fn cli_completions_rejects_unknown_shell() {
 fn cli_install_use_flag() {
     let cli = Cli::try_parse_from(["svm", "install", "--use", "v1.0.0"]).unwrap();
     match cli.command {
-        Commands::Install { version, use_after, .. } => {
+        Commands::Install {
+            version, use_after, ..
+        } => {
             assert_eq!(version, "v1.0.0");
             assert!(use_after);
         }
@@ -245,7 +247,9 @@ fn cli_install_use_flag() {
 fn cli_install_use_short_flag() {
     let cli = Cli::try_parse_from(["svm", "install", "-u", "latest"]).unwrap();
     match cli.command {
-        Commands::Install { version, use_after, .. } => {
+        Commands::Install {
+            version, use_after, ..
+        } => {
             assert_eq!(version, "latest");
             assert!(use_after);
         }
@@ -287,7 +291,9 @@ fn cli_install_default_not_full() {
 fn cli_install_full_combines_with_use() {
     let cli = Cli::try_parse_from(["svm", "install", "--full", "-u", "v1.0.0"]).unwrap();
     match cli.command {
-        Commands::Install { use_after, full, .. } => {
+        Commands::Install {
+            use_after, full, ..
+        } => {
             assert!(use_after);
             assert!(full);
         }
@@ -310,7 +316,9 @@ fn cli_remote_list_tags_only_flag() {
 fn cli_remote_list_cached_flag() {
     let cli = Cli::try_parse_from(["svm", "remote-list", "--cached", "--tags-only"]).unwrap();
     match cli.command {
-        Commands::RemoteList { cached, tags_only, .. } => {
+        Commands::RemoteList {
+            cached, tags_only, ..
+        } => {
             assert!(cached);
             assert!(tags_only);
         }
@@ -391,7 +399,8 @@ fn cli_exec_requires_version_and_command() {
 
 #[test]
 fn cli_exec_captures_command_and_args() {
-    let cli = Cli::try_parse_from(["svm", "exec", "testnet-v1.2.3", "sui", "move", "test"]).unwrap();
+    let cli =
+        Cli::try_parse_from(["svm", "exec", "testnet-v1.2.3", "sui", "move", "test"]).unwrap();
     match cli.command {
         Commands::Exec { version, command } => {
             assert_eq!(version, "testnet-v1.2.3");

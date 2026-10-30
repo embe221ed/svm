@@ -14,7 +14,10 @@ fn which_prints_active_binary_path() {
 
     let out = h.svm().arg("which").output().unwrap();
     assert!(out.status.success(), "stderr: {}", stderr_str(&out));
-    assert_eq!(stdout_str(&out).trim(), dir.join("sui").display().to_string());
+    assert_eq!(
+        stdout_str(&out).trim(),
+        dir.join("sui").display().to_string()
+    );
 
     let out = h.svm().args(["which", "move-analyzer"]).output().unwrap();
     assert!(out.status.success(), "stderr: {}", stderr_str(&out));
@@ -33,7 +36,10 @@ fn which_resolves_shorthand_global_version() {
 
     let out = h.svm().arg("which").output().unwrap();
     assert!(out.status.success(), "stderr: {}", stderr_str(&out));
-    assert_eq!(stdout_str(&out).trim(), dir.join("sui").display().to_string());
+    assert_eq!(
+        stdout_str(&out).trim(),
+        dir.join("sui").display().to_string()
+    );
 }
 
 #[test]
@@ -49,7 +55,10 @@ fn which_respects_local_pin_over_global() {
 
     let out = h.svm().arg("which").current_dir(&project).output().unwrap();
     assert!(out.status.success(), "stderr: {}", stderr_str(&out));
-    assert_eq!(stdout_str(&out).trim(), pinned.join("sui").display().to_string());
+    assert_eq!(
+        stdout_str(&out).trim(),
+        pinned.join("sui").display().to_string()
+    );
 }
 
 #[test]
@@ -102,7 +111,10 @@ fn which_resolves_series_and_channel_pins_against_installed() {
     h.set_global_version("v1.0");
     let out = h.svm().arg("which").output().unwrap();
     assert!(out.status.success(), "stderr: {}", stderr_str(&out));
-    assert_eq!(stdout_str(&out).trim(), newest.join("sui").display().to_string());
+    assert_eq!(
+        stdout_str(&out).trim(),
+        newest.join("sui").display().to_string()
+    );
 
     // Channel pin picks the newest installed release on that network
     h.set_global_version("testnet");
@@ -110,7 +122,10 @@ fn which_resolves_series_and_channel_pins_against_installed() {
     assert!(out.status.success(), "stderr: {}", stderr_str(&out));
     assert_eq!(
         stdout_str(&out).trim(),
-        h.versions_dir().join("testnet-v2.0.0/sui").display().to_string()
+        h.versions_dir()
+            .join("testnet-v2.0.0/sui")
+            .display()
+            .to_string()
     );
 }
 
@@ -167,7 +182,11 @@ fn exec_runs_managed_binary_from_requested_version_not_active_one() {
 fn exec_resolves_shorthand_version_specs() {
     let h = TestHome::new();
     h.install_fake_version("mainnet-v1.0.0", &["sui"]);
-    let out = h.svm().args(["exec", "v1.0.0", "sui", "ping"]).output().unwrap();
+    let out = h
+        .svm()
+        .args(["exec", "v1.0.0", "sui", "ping"])
+        .output()
+        .unwrap();
     assert!(out.status.success(), "stderr: {}", stderr_str(&out));
     assert_eq!(stdout_str(&out).trim(), "mainnet-v1.0.0:sui ping");
 }
@@ -194,7 +213,11 @@ fn exec_resolves_series_spec_to_newest_installed_patch() {
     let h = TestHome::new();
     h.install_fake_version("mainnet-v1.0.3", &["sui"]);
     h.install_fake_version("mainnet-v1.0.5", &["sui"]);
-    let out = h.svm().args(["exec", "v1.0", "sui", "go"]).output().unwrap();
+    let out = h
+        .svm()
+        .args(["exec", "v1.0", "sui", "go"])
+        .output()
+        .unwrap();
     assert!(out.status.success(), "stderr: {}", stderr_str(&out));
     assert_eq!(stdout_str(&out).trim(), "mainnet-v1.0.5:sui go");
 }
@@ -218,7 +241,11 @@ fn exec_runs_unmanaged_binary_from_version_dir_when_present() {
 #[test]
 fn exec_errors_when_version_not_installed() {
     let h = TestHome::new();
-    let out = h.svm().args(["exec", "mainnet-v9.9.9", "sui"]).output().unwrap();
+    let out = h
+        .svm()
+        .args(["exec", "mainnet-v9.9.9", "sui"])
+        .output()
+        .unwrap();
     assert!(!out.status.success());
     assert!(stderr_str(&out).contains("is not installed"));
 }

@@ -1,5 +1,5 @@
 use serde_json::json;
-use svm::{parse_remote_spec, parse_version_triple, resolve_remote_spec, tag_semver, RemoteSpec};
+use svm::{RemoteSpec, parse_remote_spec, parse_version_triple, resolve_remote_spec, tag_semver};
 
 fn releases_from(tags: &[&str]) -> Vec<serde_json::Value> {
     tags.iter().map(|t| json!({"tag_name": t})).collect()
@@ -63,11 +63,19 @@ fn spec_network_latest_combined() {
 fn spec_partial_version_defaults_to_mainnet() {
     assert_eq!(
         parse_remote_spec("v1.63"),
-        RemoteSpec::Partial { network: "mainnet".into(), major: 1, minor: 63 }
+        RemoteSpec::Partial {
+            network: "mainnet".into(),
+            major: 1,
+            minor: 63
+        }
     );
     assert_eq!(
         parse_remote_spec("1.63"),
-        RemoteSpec::Partial { network: "mainnet".into(), major: 1, minor: 63 }
+        RemoteSpec::Partial {
+            network: "mainnet".into(),
+            major: 1,
+            minor: 63
+        }
     );
 }
 
@@ -75,11 +83,19 @@ fn spec_partial_version_defaults_to_mainnet() {
 fn spec_partial_version_with_network_prefix() {
     assert_eq!(
         parse_remote_spec("testnet-v1.63"),
-        RemoteSpec::Partial { network: "testnet".into(), major: 1, minor: 63 }
+        RemoteSpec::Partial {
+            network: "testnet".into(),
+            major: 1,
+            minor: 63
+        }
     );
     assert_eq!(
         parse_remote_spec("devnet-1.2"),
-        RemoteSpec::Partial { network: "devnet".into(), major: 1, minor: 2 }
+        RemoteSpec::Partial {
+            network: "devnet".into(),
+            major: 1,
+            minor: 2
+        }
     );
 }
 
@@ -122,8 +138,14 @@ fn spec_custom_names_stay_exact() {
         parse_remote_spec("custom-build"),
         RemoteSpec::Exact("custom-build".into())
     );
-    assert_eq!(parse_remote_spec("vnet-foo"), RemoteSpec::Exact("vnet-foo".into()));
-    assert_eq!(parse_remote_spec("my-dev"), RemoteSpec::Exact("my-dev".into()));
+    assert_eq!(
+        parse_remote_spec("vnet-foo"),
+        RemoteSpec::Exact("vnet-foo".into())
+    );
+    assert_eq!(
+        parse_remote_spec("my-dev"),
+        RemoteSpec::Exact("my-dev".into())
+    );
 }
 
 // --- resolve_remote_spec ---
@@ -138,7 +160,10 @@ fn resolve_latest_picks_highest_semver_not_first() {
         "devnet-v1.75.0",
         "mainnet-v1.73.9",
     ]);
-    assert_eq!(resolve_remote_spec("latest", &releases).unwrap(), "mainnet-v1.74.1");
+    assert_eq!(
+        resolve_remote_spec("latest", &releases).unwrap(),
+        "mainnet-v1.74.1"
+    );
 }
 
 #[test]
@@ -149,8 +174,14 @@ fn resolve_latest_for_specific_network() {
         "testnet-v1.74.0",
         "devnet-v1.75.0",
     ]);
-    assert_eq!(resolve_remote_spec("testnet", &releases).unwrap(), "testnet-v1.74.1");
-    assert_eq!(resolve_remote_spec("devnet", &releases).unwrap(), "devnet-v1.75.0");
+    assert_eq!(
+        resolve_remote_spec("testnet", &releases).unwrap(),
+        "testnet-v1.74.1"
+    );
+    assert_eq!(
+        resolve_remote_spec("devnet", &releases).unwrap(),
+        "devnet-v1.75.0"
+    );
 }
 
 #[test]
@@ -163,15 +194,15 @@ fn resolve_partial_picks_highest_patch() {
         "testnet-v1.63.99",
     ]);
     // 1.63.11 > 1.63.4 numerically (would fail with lexicographic compare)
-    assert_eq!(resolve_remote_spec("v1.63", &releases).unwrap(), "mainnet-v1.63.11");
+    assert_eq!(
+        resolve_remote_spec("v1.63", &releases).unwrap(),
+        "mainnet-v1.63.11"
+    );
 }
 
 #[test]
 fn resolve_partial_respects_network() {
-    let releases = releases_from(&[
-        "mainnet-v1.63.4",
-        "testnet-v1.63.7",
-    ]);
+    let releases = releases_from(&["mainnet-v1.63.4", "testnet-v1.63.7"]);
     assert_eq!(
         resolve_remote_spec("testnet-v1.63", &releases).unwrap(),
         "testnet-v1.63.7"
@@ -192,7 +223,10 @@ fn resolve_latest_empty_releases_errors() {
 #[test]
 fn resolve_exact_needs_no_releases() {
     // Exact specs resolve even with an empty release list
-    assert_eq!(resolve_remote_spec("v1.63.4", &[]).unwrap(), "mainnet-v1.63.4");
+    assert_eq!(
+        resolve_remote_spec("v1.63.4", &[]).unwrap(),
+        "mainnet-v1.63.4"
+    );
     assert_eq!(
         resolve_remote_spec("testnet-v1.0.0", &[]).unwrap(),
         "testnet-v1.0.0"
@@ -203,5 +237,32 @@ fn resolve_exact_needs_no_releases() {
 #[test]
 fn resolve_ignores_releases_with_unparsable_tags() {
     let releases = releases_from(&["mainnet-v1.63.4", "mainnet-preview", "weird-tag"]);
-    assert_eq!(resolve_remote_spec("latest", &releases).unwrap(), "mainnet-v1.63.4");
+    assert_eq!(
+        resolve_remote_spec("latest", &releases).unwrap(),
+        "mainnet-v1.63.4"
+    );
+}
+
+#[test]
+fn resolve_channels_and_series_require_actual_network_release_tags() {
+    let releases = releases_from(&[
+        "mainnet-v1.63.4",
+        "testnet-v1.63.5",
+        "preview-mainnet-v99.0.0",
+        "preview-mainnet-v1.63.99",
+        "testnet-mainnet-v1.63.98",
+        "mainnet-preview-v1.63.97",
+    ]);
+    assert_eq!(
+        resolve_remote_spec("latest", &releases).unwrap(),
+        "mainnet-v1.63.4"
+    );
+    assert_eq!(
+        resolve_remote_spec("v1.63", &releases).unwrap(),
+        "mainnet-v1.63.4"
+    );
+    assert_eq!(
+        resolve_remote_spec("testnet", &releases).unwrap(),
+        "testnet-v1.63.5"
+    );
 }

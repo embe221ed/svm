@@ -1,9 +1,9 @@
 use serde_json::json;
 use std::fs;
 use svm::{
-    asset_platform, asset_sha256, completion_script, human_bytes, is_disk_full_error,
+    ReleaseCache, asset_platform, asset_sha256, completion_script, human_bytes, is_disk_full_error,
     load_cached_releases, plan_update, uninstall_version, unpack_archive, valid_version_name,
-    verify_sha256, version_sort_key, ReleaseCache,
+    verify_sha256, version_sort_key,
 };
 use tempfile::TempDir;
 
@@ -77,11 +77,23 @@ fn asset_digest_ignores_other_algorithms_and_absence() {
 
 #[test]
 fn platform_mapping_matches_sui_asset_naming() {
-    assert_eq!(asset_platform("macos", "x86_64").unwrap(), ("macos", "x86_64"));
+    assert_eq!(
+        asset_platform("macos", "x86_64").unwrap(),
+        ("macos", "x86_64")
+    );
     // macOS ARM is "arm64" but Linux ARM is "aarch64" in Sui asset names
-    assert_eq!(asset_platform("macos", "aarch64").unwrap(), ("macos", "arm64"));
-    assert_eq!(asset_platform("linux", "x86_64").unwrap(), ("ubuntu", "x86_64"));
-    assert_eq!(asset_platform("linux", "aarch64").unwrap(), ("ubuntu", "aarch64"));
+    assert_eq!(
+        asset_platform("macos", "aarch64").unwrap(),
+        ("macos", "arm64")
+    );
+    assert_eq!(
+        asset_platform("linux", "x86_64").unwrap(),
+        ("ubuntu", "x86_64")
+    );
+    assert_eq!(
+        asset_platform("linux", "aarch64").unwrap(),
+        ("ubuntu", "aarch64")
+    );
 }
 
 #[test]
@@ -190,7 +202,13 @@ fn plan_update_rejects_linked_builds_with_network_substrings() {
     // network_label would substring-match these; the structural release check
     // must not (a linked build named "mainnet-fork" is not a mainnet release)
     let releases = releases_from(&["mainnet-v1.74.1", "testnet-v1.75.0", "devnet-v1.76.0"]);
-    for name in ["mainnet-fork", "testnet-dev", "devnet-local", "sui-testnet-build", "testnet"] {
+    for name in [
+        "mainnet-fork",
+        "testnet-dev",
+        "devnet-local",
+        "sui-testnet-build",
+        "testnet",
+    ] {
         assert!(
             plan_update(name, &releases).is_err(),
             "{name} must be classified as a custom build"
@@ -281,7 +299,11 @@ fn unpack_extracts_atomically_and_cleans_staging() {
     let versions = tmp.path().join("versions");
     fs::create_dir_all(&versions).unwrap();
     let archive = tmp.path().join("sui-test.tgz");
-    fs::write(&archive, make_tgz(&[("sui", b"binary"), ("move-analyzer", b"lsp")])).unwrap();
+    fs::write(
+        &archive,
+        make_tgz(&[("sui", b"binary"), ("move-analyzer", b"lsp")]),
+    )
+    .unwrap();
 
     unpack_archive(&archive, &versions, "mainnet-v9.9.9", false).unwrap();
 
@@ -346,11 +368,20 @@ fn unpack_default_skips_unmanaged_binaries() {
     let target = versions.join("mainnet-v9.9.9");
     assert_eq!(fs::read(target.join("sui")).unwrap(), b"binary");
     assert_eq!(fs::read(target.join("move-analyzer")).unwrap(), b"lsp");
-    assert!(!target.join("sui-debug").exists(), "unmanaged binaries must be skipped");
+    assert!(
+        !target.join("sui-debug").exists(),
+        "unmanaged binaries must be skipped"
+    );
     assert!(!target.join("sui-node").exists());
     // Exec bits survive the selective extraction path too
-    let mode = fs::metadata(target.join("sui")).unwrap().permissions().mode();
-    assert!(mode & 0o111 != 0, "sui must stay executable, mode: {mode:o}");
+    let mode = fs::metadata(target.join("sui"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert!(
+        mode & 0o111 != 0,
+        "sui must stay executable, mode: {mode:o}"
+    );
 }
 
 #[test]
@@ -361,7 +392,11 @@ fn unpack_full_extracts_everything() {
     let archive = tmp.path().join("sui-test.tgz");
     fs::write(
         &archive,
-        make_tgz(&[("sui", b"binary"), ("sui-debug", b"dbg"), ("sui-node", b"node")]),
+        make_tgz(&[
+            ("sui", b"binary"),
+            ("sui-debug", b"dbg"),
+            ("sui-node", b"node"),
+        ]),
     )
     .unwrap();
 
@@ -382,7 +417,11 @@ fn unpack_default_extracts_nested_managed_binaries() {
     let versions = tmp.path().join("versions");
     fs::create_dir_all(&versions).unwrap();
     let archive = tmp.path().join("sui-test.tgz");
-    fs::write(&archive, make_tgz(&[("nested/sui", b"deep"), ("nested/sui-node", b"skip")])).unwrap();
+    fs::write(
+        &archive,
+        make_tgz(&[("nested/sui", b"deep"), ("nested/sui-node", b"skip")]),
+    )
+    .unwrap();
 
     unpack_archive(&archive, &versions, "mainnet-v9.9.9", false).unwrap();
 
@@ -399,7 +438,11 @@ fn unpack_default_falls_back_to_full_for_unknown_layouts() {
     let versions = tmp.path().join("versions");
     fs::create_dir_all(&versions).unwrap();
     let archive = tmp.path().join("sui-test.tgz");
-    fs::write(&archive, make_tgz(&[("bin/tools.txt", b"t"), ("README", b"r")])).unwrap();
+    fs::write(
+        &archive,
+        make_tgz(&[("bin/tools.txt", b"t"), ("README", b"r")]),
+    )
+    .unwrap();
 
     unpack_archive(&archive, &versions, "mainnet-v9.9.9", false).unwrap();
 
@@ -422,7 +465,10 @@ fn disk_full_errors_are_detected_through_the_chain() {
 
     let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
     let err = anyhow::Error::from(denied).context("failed to unpack `sui`");
-    assert!(!is_disk_full_error(&err), "only disk-space errors keep the cached archive");
+    assert!(
+        !is_disk_full_error(&err),
+        "only disk-space errors keep the cached archive"
+    );
 }
 
 // --- load_cached_releases ---
@@ -437,7 +483,11 @@ fn load_cached_releases_reads_valid_cache() {
         pages: 1,
         releases: releases_from(&["mainnet-v1.0.0", "testnet-v1.0.0"]),
     };
-    fs::write(cache_dir.join("releases.json"), serde_json::to_string(&cache).unwrap()).unwrap();
+    fs::write(
+        cache_dir.join("releases.json"),
+        serde_json::to_string(&cache).unwrap(),
+    )
+    .unwrap();
 
     let releases = load_cached_releases(tmp.path()).unwrap();
     assert_eq!(releases.len(), 2);

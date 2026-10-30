@@ -1,5 +1,5 @@
 use std::fs;
-use svm::{resolve_version, VersionSource};
+use svm::{VersionSource, resolve_version};
 use tempfile::TempDir;
 
 #[test]

@@ -13,7 +13,10 @@ fn link_copies_binaries_instead_of_symlinking() {
     let src = h.home().join("build");
     fs::create_dir_all(&src).unwrap();
     write_exec_script(&src.join("sui"), "echo my-fork:sui \"$@\"");
-    write_exec_script(&src.join("move-analyzer"), "echo my-fork:move-analyzer \"$@\"");
+    write_exec_script(
+        &src.join("move-analyzer"),
+        "echo my-fork:move-analyzer \"$@\"",
+    );
 
     let out = h
         .svm()
@@ -58,7 +61,10 @@ fn rebuilding_source_does_not_change_linked_copy_until_relink() {
     write_exec_script(&src.join("sui"), "echo v2-rebuilt");
 
     let copy = fs::read_to_string(h.versions_dir().join("my-fork/sui")).unwrap();
-    assert!(copy.contains("echo v1"), "the copy must not track the rebuild");
+    assert!(
+        copy.contains("echo v1"),
+        "the copy must not track the rebuild"
+    );
 
     // Re-linking refreshes the copy
     let out = h
@@ -125,7 +131,11 @@ fn relink_of_release_shaped_link_name_is_allowed_via_marker() {
         .args(["link", "testnet-v0.0.1", src.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(out.status.success(), "re-link must succeed: {}", stderr_str(&out));
+    assert!(
+        out.status.success(),
+        "re-link must succeed: {}",
+        stderr_str(&out)
+    );
     let copy = fs::read_to_string(h.versions_dir().join("testnet-v0.0.1/sui")).unwrap();
     assert!(copy.contains("echo b2"));
 }
@@ -150,7 +160,10 @@ fn link_refuses_release_dir_even_without_top_level_binaries() {
         .unwrap();
     assert!(!out.status.success());
     assert!(stderr_str(&out).contains("is an installed release"));
-    assert!(release.join("bin/sui").exists(), "release contents must survive");
+    assert!(
+        release.join("bin/sui").exists(),
+        "release contents must survive"
+    );
 }
 
 #[test]
@@ -176,7 +189,10 @@ fn link_source_inside_target_is_refused_and_nothing_is_destroyed() {
     assert!(!out.status.success());
     assert!(stderr_str(&out).contains("is inside the link target"));
     let copy = fs::read_to_string(inside.join("sui")).unwrap();
-    assert!(copy.contains("echo original"), "linked build must be untouched");
+    assert!(
+        copy.contains("echo original"),
+        "linked build must be untouched"
+    );
 }
 
 #[test]
@@ -230,7 +246,12 @@ fn link_searches_target_release_by_default() {
     fs::create_dir_all(&release).unwrap();
     write_exec_script(&release.join("sui"), "echo from-target-release");
 
-    let out = h.svm().args(["link", "dev"]).current_dir(&project).output().unwrap();
+    let out = h
+        .svm()
+        .args(["link", "dev"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
     assert!(out.status.success(), "stderr: {}", stderr_str(&out));
     assert!(h.versions_dir().join("dev/sui").exists());
 }
@@ -273,7 +294,9 @@ fn linked_build_runs_through_use_and_shim_end_to_end() {
     let out = h.svm().args(["use", "my-fork"]).output().unwrap();
     assert!(out.status.success(), "stderr: {}", stderr_str(&out));
     assert_eq!(
-        fs::read_to_string(h.svm_dir().join("version")).unwrap().trim(),
+        fs::read_to_string(h.svm_dir().join("version"))
+            .unwrap()
+            .trim(),
         "my-fork"
     );
 

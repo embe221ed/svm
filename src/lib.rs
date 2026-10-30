@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::{generate, Shell};
+use clap_complete::{Shell, generate};
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
@@ -10,6 +10,9 @@ use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+#[cfg(test)]
+mod picker_tests;
 
 pub const GITHUB_API: &str = "https://api.github.com/repos/MystenLabs/sui/releases";
 const DOWNLOAD_BASE: &str = "https://github.com/MystenLabs/sui/releases/download";
@@ -101,7 +104,9 @@ pub enum Commands {
         #[arg(value_hint = clap::ValueHint::DirPath)]
         path: Option<PathBuf>,
     },
-    /// List local versions (active one marked with *)
+    /// Open a guided menu for switching, pinning and installing versions
+    Interactive,
+    /// List local versions (active one marked with a checkmark)
     List,
     /// Show the currently active version
     Show,
@@ -167,10 +172,20 @@ fn strip_leading_ansi(s: &str) -> &str {
 /// when handed an absolute path, and a hostile `.svm-version` file in a
 /// cloned repo would otherwise let the shim execute an arbitrary binary.
 pub fn valid_version_name(name: &str) -> bool {
-    !name.is_empty() && !name.starts_with('.') && !name.contains('/') && !name.contains('\\')
+    !name.is_empty()
+        && !name.starts_with(['.', '-'])
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.chars().any(char::is_control)
 }
 
 pub fn run() -> Result<()> {
+    // Use the same color policy for ordinary messages and release tables.
+    if std::env::var_os("NO_COLOR").is_some()
+        || std::env::var("TERM").is_ok_and(|term| term == "dumb")
+    {
+        colored::control::set_override(false);
+    }
     // 1. Shim Detection
     let args: Vec<String> = std::env::args().collect();
     if let Some(program_name) = args.first().and_then(|p| Path::new(p).file_name()) {
@@ -182,6 +197,10 @@ pub fn run() -> Result<()> {
 
     // 2. Standard CLI
     let cli = Cli::parse();
+    if let Commands::Completions { shell } = &cli.command {
+        print_completions(*shell);
+        return Ok(());
+    }
     let svm_dir = dirs::home_dir().context("No home dir")?.join(".svm");
     let versions_dir = svm_dir.join("versions");
     let bin_dir = svm_dir.join("bin");
@@ -190,10 +209,18 @@ pub fn run() -> Result<()> {
     fs::create_dir_all(&bin_dir)?;
 
     match cli.command {
-        Commands::RemoteList { network, pages, plain, tags_only, cached } => {
-            list_remote(network, &svm_dir, pages, plain, tags_only, cached)?
-        }
-        Commands::Install { version, use_after, full } => {
+        Commands::RemoteList {
+            network,
+            pages,
+            plain,
+            tags_only,
+            cached,
+        } => list_remote(network, &svm_dir, pages, plain, tags_only, cached)?,
+        Commands::Install {
+            version,
+            use_after,
+            full,
+        } => {
             install_version(&version, &versions_dir, &svm_dir, use_after, true, full)?;
         }
         Commands::Update => update_version(&versions_dir, &svm_dir)?,
@@ -202,6 +229,7 @@ pub fn run() -> Result<()> {
         Commands::Exec { version, command } => exec_command(&version, &command, &versions_dir)?,
         Commands::Which { binary } => which_command(&binary, &svm_dir)?,
         Commands::Link { name, path } => link_local(&name, path.as_deref(), &versions_dir)?,
+        Commands::Interactive => interactive_mode(&versions_dir, &svm_dir, &bin_dir)?,
         Commands::List => list_local(&versions_dir, &svm_dir)?,
         Commands::Show => show_version(&svm_dir)?,
         Commands::Unset => unset_version(&bin_dir, &svm_dir)?,
@@ -216,11 +244,7 @@ pub fn run() -> Result<()> {
 fn read_version_file(path: &Path) -> Result<Option<String>> {
     let content = fs::read_to_string(path)?;
     let v = content.lines().next().unwrap_or("").trim().to_string();
-    if v.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(v))
-    }
+    if v.is_empty() { Ok(None) } else { Ok(Some(v)) }
 }
 
 pub fn resolve_version(svm_dir: &Path) -> Result<Option<(String, VersionSource)>> {
@@ -364,7 +388,7 @@ fn shim_auto_install(
         AutoInstall::Never => return Ok(None),
         AutoInstall::Always => eprintln!(
             "{} Version {} is not installed — installing it now (SVM_AUTO_INSTALL).",
-            "ℹ".blue(),
+            "info:".blue(),
             shown.cyan()
         ),
         AutoInstall::Ask => {
@@ -423,14 +447,16 @@ fn which_command(binary: &str, svm_dir: &Path) -> Result<()> {
 }
 
 fn exec_command(version: &str, command: &[String], versions_dir: &Path) -> Result<()> {
-    let (resolved, version_dir) = resolve_available_version(version, versions_dir)
-        .ok_or_else(|| anyhow!(
-            "{} Version '{}' is not installed.\n{} Run '{}' first.",
-            "error:".red().bold(),
-            version.yellow(),
-            "help:".blue().bold(),
-            format!("svm install {}", version).cyan()
-        ))?;
+    let (resolved, version_dir) =
+        resolve_available_version(version, versions_dir).ok_or_else(|| {
+            anyhow!(
+                "{} Version '{}' is not installed.\n{} Run '{}' first.",
+                "error:".red().bold(),
+                version.yellow(),
+                "help:".blue().bold(),
+                format!("svm install {}", version).cyan()
+            )
+        })?;
 
     let (program, args) = command
         .split_first()
@@ -470,7 +496,7 @@ fn exec_command(version: &str, command: &[String], versions_dir: &Path) -> Resul
                 }
                 Err(_) => eprintln!(
                     "{} Could not prepend {:?} to PATH (path contains a separator) — running with the unmodified PATH.",
-                    "⚠".yellow(),
+                    "warning:".yellow(),
                     version_dir
                 ),
             }
@@ -481,7 +507,11 @@ fn exec_command(version: &str, command: &[String], versions_dir: &Path) -> Resul
     }
 
     let err = cmd.exec();
-    Err(anyhow!("Failed to execute '{}': {}", program_path.display(), err))
+    Err(anyhow!(
+        "Failed to execute '{}': {}",
+        program_path.display(),
+        err
+    ))
 }
 
 fn unset_version(bin_dir: &Path, svm_dir: &Path) -> Result<()> {
@@ -503,9 +533,13 @@ fn unset_version(bin_dir: &Path, svm_dir: &Path) -> Result<()> {
     }
 
     if removed > 0 {
-        println!("{} SVM deactivated. Shims removed from {:?}", "✔".green(), bin_dir);
+        println!(
+            "{} SVM deactivated. Shims removed from {:?}",
+            "✔".green(),
+            bin_dir
+        );
     } else {
-        println!("{} SVM was not active.", "ℹ".blue());
+        println!("{} SVM was not active.", "info:".blue());
     }
     Ok(())
 }
@@ -513,25 +547,34 @@ fn unset_version(bin_dir: &Path, svm_dir: &Path) -> Result<()> {
 fn show_version(svm_dir: &Path) -> Result<()> {
     match resolve_version(svm_dir)? {
         Some((v, source)) => {
-            print!("{} Current version: {}", "➜".cyan(), v.green().bold());
+            let shown = sanitize_display(&v);
+            print!(
+                "{} Current version: {}",
+                "info:".cyan(),
+                shown.green().bold()
+            );
             match source {
                 VersionSource::Global => println!(" ({})", "global".dimmed()),
                 VersionSource::Local(path) => {
-                    println!("\n  {} set by {}", "↳".dimmed(), path.display().to_string().blue());
+                    println!(
+                        "\n  {} set by {}",
+                        "from".dimmed(),
+                        path.display().to_string().blue()
+                    );
                 }
             }
             let versions_dir = svm_dir.join("versions");
             if resolve_available_version(&v, &versions_dir).is_none() {
                 println!(
                     "  {} not installed — run '{}'",
-                    "⚠".yellow(),
-                    format!("svm install {}", v).cyan()
+                    "warning:".yellow(),
+                    format!("svm install {}", shown).cyan()
                 );
             }
         }
         None => println!(
             "{} No version currently in use. Run '{}' to set one.",
-            "ℹ".blue(),
+            "info:".blue(),
             "svm use <version>".cyan()
         ),
     }
@@ -540,8 +583,16 @@ fn show_version(svm_dir: &Path) -> Result<()> {
 
 // --- GitHub API helpers ---
 
+#[cfg(test)]
+mod cache_tests;
+
 pub fn build_client() -> Result<reqwest::blocking::Client> {
-    let mut builder = reqwest::blocking::Client::builder().user_agent(USER_AGENT);
+    // The blocking client's operation timeout also bounds each body read,
+    // rather than imposing a 30-second limit on an entire multi-GiB archive.
+    let mut builder = reqwest::blocking::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30));
     // Never attach the GitHub token when the endpoints are overridden: it is
     // a default header on every request this client makes, and it must not
     // leak to whatever host SVM_API_BASE/SVM_DOWNLOAD_BASE point at.
@@ -574,13 +625,28 @@ pub struct ReleaseCache {
     pub releases: Vec<serde_json::Value>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SourcedReleaseCache {
+    #[serde(flatten)]
+    cache: ReleaseCache,
+    // Older caches have no source. They predate endpoint isolation, so only
+    // the official API may read them; a mirror must fetch its own metadata.
+    #[serde(default)]
+    source: Option<String>,
+}
+
+fn read_release_cache(svm_dir: &Path, source: &str) -> Option<ReleaseCache> {
+    let content = fs::read_to_string(svm_dir.join("cache/releases.json")).ok()?;
+    let cached: SourcedReleaseCache = serde_json::from_str(&content).ok()?;
+    if cached.source.as_deref().unwrap_or(GITHUB_API) != source {
+        return None;
+    }
+    Some(cached.cache)
+}
+
 /// Read the cached release list without touching the network.
 pub fn load_cached_releases(svm_dir: &Path) -> Option<Vec<serde_json::Value>> {
-    let cache_file = svm_dir.join("cache").join("releases.json");
-    let content = fs::read_to_string(cache_file).ok()?;
-    serde_json::from_str::<ReleaseCache>(&content)
-        .ok()
-        .map(|c| c.releases)
+    read_release_cache(svm_dir, &api_base()).map(|c| c.releases)
 }
 
 /// Fetch releases with ETag-based caching and pagination.
@@ -606,9 +672,7 @@ pub fn fetch_releases_impl(
     let cache_file = cache.join("releases.json");
     let limit = (max_pages as usize) * 100;
 
-    let cached = fs::read_to_string(&cache_file)
-        .ok()
-        .and_then(|s| serde_json::from_str::<ReleaseCache>(&s).ok());
+    let cached = read_release_cache(svm_dir, base_url);
 
     let mut all_releases: Vec<serde_json::Value> = Vec::new();
     let mut new_etag: Option<String> = None;
@@ -621,7 +685,11 @@ pub fn fetch_releases_impl(
         && let Some(ref etag) = cached.etag
     {
         let url = format!("{}?per_page=100&page=1", base_url);
-        match client.get(&url).header("If-None-Match", etag.as_str()).send() {
+        match client
+            .get(&url)
+            .header("If-None-Match", etag.as_str())
+            .send()
+        {
             Ok(resp) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {
                 return Ok(cached.releases[..limit.min(cached.releases.len())].to_vec());
             }
@@ -637,14 +705,20 @@ pub fn fetch_releases_impl(
                     }
                     Err(_) => {
                         // Truncated/garbled body — fall back to the stale cache
-                        eprintln!("{} Using cached release list (bad response body).", "ℹ".blue());
+                        eprintln!(
+                            "{} Using cached release list (bad response body).",
+                            "info:".blue()
+                        );
                         return Ok(cached.releases[..limit.min(cached.releases.len())].to_vec());
                     }
                 }
             }
             _ => {
                 // Network/API error — use stale cache as fallback
-                eprintln!("{} Using cached release list (request failed).", "ℹ".blue());
+                eprintln!(
+                    "{} Using cached release list (request failed).",
+                    "info:".blue()
+                );
                 return Ok(cached.releases[..limit.min(cached.releases.len())].to_vec());
             }
         }
@@ -656,10 +730,10 @@ pub fn fetch_releases_impl(
             match client.get(&url).send() {
                 Ok(resp) => {
                     if !resp.status().is_success() {
-                        if page == 1 && let Some(cached) = cached {
+                        if let Some(cached) = cached {
                             eprintln!(
                                 "{} Using cached release list (API returned {}).",
-                                "ℹ".blue(),
+                                "info:".blue(),
                                 resp.status()
                             );
                             let r = &cached.releases;
@@ -675,10 +749,10 @@ pub fn fetch_releases_impl(
                     let page_releases: Vec<serde_json::Value> = match resp.json() {
                         Ok(p) => p,
                         Err(e) => {
-                            if page == 1 && let Some(cached) = cached {
+                            if let Some(cached) = cached {
                                 eprintln!(
                                     "{} Using cached release list (bad response body).",
-                                    "ℹ".blue()
+                                    "info:".blue()
                                 );
                                 let r = &cached.releases;
                                 return Ok(r[..limit.min(r.len())].to_vec());
@@ -694,10 +768,10 @@ pub fn fetch_releases_impl(
                     }
                 }
                 Err(e) => {
-                    if page == 1 && let Some(cached) = cached {
+                    if let Some(cached) = cached {
                         eprintln!(
                             "{} Using cached release list (network error: {}).",
-                            "ℹ".blue(),
+                            "info:".blue(),
                             e
                         );
                         let r = &cached.releases;
@@ -711,12 +785,25 @@ pub fn fetch_releases_impl(
 
     // Only update cache if we got results
     if !all_releases.is_empty() {
-        let new_cache = ReleaseCache {
-            etag: new_etag,
-            pages: max_pages,
-            releases: all_releases.clone(),
+        let new_cache = SourcedReleaseCache {
+            cache: ReleaseCache {
+                etag: new_etag,
+                pages: max_pages,
+                releases: all_releases,
+            },
+            source: Some(base_url.to_string()),
         };
-        let _ = fs::write(&cache_file, serde_json::to_string(&new_cache)?);
+        // Write beside the destination and atomically replace it. Readers
+        // never observe truncated JSON, including during concurrent refreshes.
+        // Cache persistence is best effort; a read-only/full disk must not
+        // discard successfully fetched release data.
+        let _ = (|| -> Result<()> {
+            let mut file = tempfile::NamedTempFile::new_in(&cache)?;
+            serde_json::to_writer(file.as_file_mut(), &new_cache)?;
+            file.persist(&cache_file)?;
+            Ok(())
+        })();
+        return Ok(new_cache.cache.releases);
     }
 
     Ok(all_releases)
@@ -742,9 +829,9 @@ pub fn fetch_release_assets(
     match client.get(&url).send() {
         Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => ReleaseLookup::NotFound,
         Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>() {
-            Ok(release) => ReleaseLookup::Found(
-                release["assets"].as_array().cloned().unwrap_or_default(),
-            ),
+            Ok(release) => {
+                ReleaseLookup::Found(release["assets"].as_array().cloned().unwrap_or_default())
+            }
             Err(_) => ReleaseLookup::Unavailable,
         },
         _ => ReleaseLookup::Unavailable,
@@ -761,7 +848,7 @@ pub fn asset_sha256(asset: &serde_json::Value) -> Option<String> {
 
 // --- Output formatting ---
 
-/// Table color palette (Gruvbox Material Dark truecolor).
+/// Restrained terminal palette that follows the user's terminal theme.
 pub struct Colors {
     green: &'static str,
     yellow: &'static str,
@@ -775,13 +862,13 @@ pub struct Colors {
 }
 
 pub const COLORS_ON: Colors = Colors {
-    green: "\x1b[38;2;169;182;101m",  // #a9b665
-    yellow: "\x1b[38;2;216;166;87m",  // #d8a657
-    blue: "\x1b[38;2;125;174;163m",   // #7daea3
-    aqua: "\x1b[38;2;137;180;130m",   // #89b482
-    fg: "\x1b[38;2;221;199;161m",     // #ddc7a1
-    dim: "\x1b[38;2;141;135;125m",    // #8d877d
-    border: "\x1b[38;2;80;73;69m",    // #504945
+    green: "\x1b[32m",  // terminal green
+    yellow: "\x1b[33m", // terminal amber
+    blue: "\x1b[34m",   // terminal blue
+    aqua: "\x1b[36m",   // terminal cyan
+    fg: "\x1b[39m",     // terminal foreground
+    dim: "\x1b[2m",     // dim foreground
+    border: "\x1b[2m",  // dim separators
     reset: "\x1b[0m",
     bold: "\x1b[1m",
 };
@@ -800,7 +887,10 @@ pub const COLORS_OFF: Colors = Colors {
 
 /// Colors only when stdout is a terminal and NO_COLOR is unset.
 fn detect_colors() -> &'static Colors {
-    if std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal() {
+    if std::env::var_os("NO_COLOR").is_none()
+        && !std::env::var("TERM").is_ok_and(|term| term == "dumb")
+        && std::io::stdout().is_terminal()
+    {
         &COLORS_ON
     } else {
         &COLORS_OFF
@@ -808,10 +898,15 @@ fn detect_colors() -> &'static Colors {
 }
 
 pub fn network_label(tag: &str) -> &'static str {
-    if tag.contains("mainnet") { "mainnet" }
-    else if tag.contains("testnet") { "testnet" }
-    else if tag.contains("devnet") { "devnet" }
-    else { "other" }
+    if tag.contains("mainnet") {
+        "mainnet"
+    } else if tag.contains("testnet") {
+        "testnet"
+    } else if tag.contains("devnet") {
+        "devnet"
+    } else {
+        "other"
+    }
 }
 
 fn network_rank(tag: &str) -> u8 {
@@ -827,8 +922,8 @@ fn network_color(net: &str, c: &'static Colors) -> &'static str {
     match net {
         "mainnet" => c.green,
         "testnet" => c.yellow,
-        "devnet"  => c.blue,
-        _         => c.dim,
+        "devnet" => c.blue,
+        _ => c.dim,
     }
 }
 
@@ -870,24 +965,22 @@ fn format_release_line(tag: &str, installed: &[String], c: &'static Colors) -> S
     };
     // Pad plain text first, then wrap with color
     format!(
-        " {nc}●{r}  {aqua}{b}{ver:<12}{r}  {bd}│{r}  {nc}{net:>7}{r}  {bd}│{r}  {dim}{tag}{r}{mark}",
+        "    {aqua}{b}{ver:<12}{r}  {nc}{net:>7}{r}  {dim}{tag}{r}{mark}",
         r = c.reset,
         aqua = c.aqua,
         b = c.bold,
-        bd = c.border,
         dim = c.dim,
     )
 }
 
 fn table_header(c: &'static Colors) -> String {
     format!(
-        "    {fg}{b}{:<12}{r}  {bd}│{r}  {fg}{b}{:>7}{r}  {bd}│{r}  {fg}{b}Tag{r}",
+        "    {fg}{b}{:<12}{r}  {fg}{b}{:>7}{r}  {fg}{b}Tag{r}",
         "Version",
         "Network",
         fg = c.fg,
         b = c.bold,
         r = c.reset,
-        bd = c.border,
     )
 }
 
@@ -922,7 +1015,7 @@ fn list_remote(
     {
         eprintln!(
             "{} '{}' does not match any known network ({}) — filtering tags by substring.",
-            "⚠".yellow(),
+            "warning:".yellow(),
             filter,
             NETWORKS.join(", ")
         );
@@ -933,6 +1026,7 @@ fn list_remote(
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .collect()
         })
@@ -941,7 +1035,9 @@ fn list_remote(
     let mut tags: Vec<&str> = Vec::new();
     for release in &releases {
         let tag = release["tag_name"].as_str().unwrap_or("");
-        if tag.is_empty() { continue; }
+        if !valid_version_name(tag) {
+            continue;
+        }
         if let Some(ref filter) = network_filter
             && !tag.contains(filter.as_str())
         {
@@ -958,72 +1054,184 @@ fn list_remote(
     }
 
     if tags.is_empty() {
-        let source = if cached_only { " in the local cache" } else { "" };
+        let source = if cached_only {
+            " in the local cache"
+        } else {
+            ""
+        };
         match network_filter {
-            Some(f) => println!("{} No releases matching '{}' found{}.", "ℹ".blue(), f, source),
-            None => println!("{} No releases found{}.", "ℹ".blue(), source),
+            Some(f) => println!(
+                "{} No releases matching '{}' found{}.",
+                "info:".blue(),
+                f,
+                source
+            ),
+            None => println!("{} No releases found{}.", "info:".blue(), source),
         }
         return Ok(());
     }
 
     let colors = detect_colors();
 
-    if plain || !std::io::stdout().is_terminal() {
+    if plain || !interactive_terminal() {
         print_release_table(&tags, &installed, colors);
         return Ok(());
     }
 
-    let header = table_header(colors);
-    let lines: Vec<String> = tags.iter().map(|tag| format_release_line(tag, &installed, colors)).collect();
-    let input = lines.join("\n");
-
-    let spawned = Command::new("fzf")
-        .args([
-            "--ansi",
-            "--reverse",
-            "--header", &header,
-            "--prompt", "  Filter > ",
-            "--pointer", "▶",
-            "--marker", "●",
-            "--color", "header:bold,prompt:#89b482,pointer:#89b482,marker:#a9b665,hl:#e78a4e,hl+:#e78a4e",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn();
-
-    let mut child = match spawned {
-        Ok(child) => child,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // fzf missing — degrade to the plain table, as the help text promises
+    let lines: Vec<String> = tags
+        .iter()
+        .map(|tag| format_release_line(tag, &installed, &COLORS_OFF))
+        .collect();
+    let selected = match fuzzy_pick(
+        &lines,
+        "Releases | Type to filter | Enter to select | Esc to cancel",
+    ) {
+        Ok(selected) => selected,
+        Err(err) if picker_missing(&err) => {
             eprintln!(
                 "{} fzf is not installed — showing a plain list instead.",
-                "ℹ".blue()
+                "info:".blue()
             );
             print_release_table(&tags, &installed, colors);
             return Ok(());
         }
-        Err(e) => return Err(e).context("Failed to launch fzf"),
+        Err(err) => return Err(err),
     };
-
-    if let Some(ref mut stdin) = child.stdin {
-        use std::io::Write;
-        let _ = stdin.write_all(input.as_bytes());
+    if let Some(index) = selected {
+        let tag = tags[index];
+        println!("{}", tag);
+        if !installed.iter().any(|i| i == tag)
+            && prompt_yes_no(&format!("Install {}?", tag.cyan()))?
+        {
+            install_version(tag, &versions_dir, svm_dir, false, true, false)?;
+        }
     }
-    let output = child.wait_with_output()?;
+    Ok(())
+}
 
-    if output.status.success() {
-        let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if let Some(tag) = tags.iter().find(|t| selected.contains(**t)).copied() {
-            println!("{}", tag);
-            let already_installed = installed.iter().any(|i| i == tag);
-            let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-            if !already_installed
-                && interactive
-                && prompt_yes_no(&format!("Install {}?", tag.cyan()))?
-            {
-                install_version(tag, &versions_dir, svm_dir, false, true, false)?;
+fn interactive_terminal() -> bool {
+    std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::io::stderr().is_terminal()
+}
+
+fn picker_missing(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn fuzzy_pick(rows: &[String], header: &str) -> Result<Option<usize>> {
+    picker_command(Command::new("fzf"), rows, header)
+}
+
+fn picker_command(mut command: Command, rows: &[String], header: &str) -> Result<Option<usize>> {
+    use std::io::{Seek, Write};
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    // A file avoids blocking on a full stdin pipe if fzf exits early or a
+    // large list is supplied. The unnamed file is removed automatically.
+    let mut input = tempfile::tempfile().context("Could not prepare picker input")?;
+    for row in rows {
+        writeln!(input, "{}", row)?;
+    }
+    input.rewind()?;
+    command
+        .env_remove("FZF_DEFAULT_OPTS")
+        .env_remove("FZF_DEFAULT_OPTS_FILE")
+        .env_remove("FZF_DEFAULT_COMMAND")
+        .args([
+            "--no-multi",
+            "--reverse",
+            "--height=80%",
+            "--border=rounded",
+            "--info=inline",
+            "--prompt=Search > ",
+            "--pointer=>",
+            "--marker=+",
+            "--header",
+            header,
+        ])
+        .stdin(Stdio::from(input))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    if std::env::var_os("NO_COLOR").is_some()
+        || std::env::var("TERM").is_ok_and(|term| term == "dumb")
+    {
+        command.arg("--color=bw");
+    } else {
+        command.arg("--color=prompt:blue,pointer:cyan,hl:blue,hl+:cyan,header:gray");
+    }
+    let output = command.output().context("Failed to run fzf")?;
+    match output.status.code() {
+        Some(1 | 130) => Ok(None), // No match or Esc/Ctrl-C.
+        Some(0) => {
+            let selected = std::str::from_utf8(&output.stdout)
+                .context("fzf returned invalid text")?
+                .trim_end_matches('\n');
+            rows.iter()
+                .position(|row| row == selected)
+                .map(Some)
+                .ok_or_else(|| anyhow!("fzf returned an unknown selection; no action was taken"))
+        }
+        _ => Err(anyhow!(
+            "fzf failed ({}); no action was taken",
+            output.status
+        )),
+    }
+}
+
+fn interactive_mode(versions_dir: &Path, svm_dir: &Path, bin_dir: &Path) -> Result<()> {
+    if !interactive_terminal() {
+        return Err(anyhow!(
+            "Interactive mode requires a terminal. Use 'svm list', 'svm use <version>' or 'svm remote-list --plain'."
+        ));
+    }
+    let actions: Vec<String> = [
+        "Switch global version",
+        "Pin version in this directory",
+        "Browse and install releases",
+        "Show active version",
+        "List installed versions",
+        "Inspect cache",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let selected = fuzzy_pick(&actions, "SVM | Type to filter | Enter to select | Esc to cancel")
+        .map_err(|err| if picker_missing(&err) {
+            anyhow!("Interactive mode requires fzf on PATH. Install fzf, or use 'svm list' and 'svm use <version>'.")
+        } else { err })?;
+    match selected {
+        Some(0 | 1) => {
+            let local = selected == Some(1);
+            let mut versions: Vec<String> = fs::read_dir(versions_dir)?
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().is_dir())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| valid_version_name(name))
+                .collect();
+            versions.sort_by_key(|name| version_sort_key(name));
+            if versions.is_empty() {
+                println!(
+                    "No installed versions. Run 'svm install latest' or 'svm remote-list' to get started."
+                );
+                return Ok(());
+            }
+            let header = if local {
+                "Pin in this directory | Enter to confirm | Esc to cancel"
+            } else {
+                "Set global default | Enter to confirm | Esc to cancel"
+            };
+            if let Some(index) = fuzzy_pick(&versions, header)? {
+                use_version(&versions[index], versions_dir, bin_dir, local)?;
             }
         }
+        Some(2) => list_remote(None, svm_dir, 3, false, false, false)?,
+        Some(3) => show_version(svm_dir)?,
+        Some(4) => list_local(versions_dir, svm_dir)?,
+        Some(5) => cache_command(svm_dir, None)?,
+        _ => {}
     }
     Ok(())
 }
@@ -1067,7 +1275,11 @@ pub enum RemoteSpec {
     /// The newest release on a network ("latest", "testnet", ...).
     LatestForNetwork(String),
     /// The newest patch release for a major.minor series ("v1.63").
-    Partial { network: String, major: u64, minor: u64 },
+    Partial {
+        network: String,
+        major: u64,
+        minor: u64,
+    },
 }
 
 /// Normalize a user-provided version string into a full release tag.
@@ -1100,7 +1312,11 @@ pub fn parse_remote_spec(spec: &str) -> RemoteSpec {
             return RemoteSpec::LatestForNetwork(net.into());
         }
         if let Some((major, minor)) = parse_version_pair(rest) {
-            return RemoteSpec::Partial { network: net.into(), major, minor };
+            return RemoteSpec::Partial {
+                network: net.into(),
+                major,
+                minor,
+            };
         }
         if let Some((major, minor, patch)) = parse_version_triple(rest) {
             // "testnet-1.63.4" — insert the "v" like we do for bare versions
@@ -1109,7 +1325,11 @@ pub fn parse_remote_spec(spec: &str) -> RemoteSpec {
         return RemoteSpec::Exact(spec.into());
     }
     if let Some((major, minor)) = parse_version_pair(spec) {
-        return RemoteSpec::Partial { network: "mainnet".into(), major, minor };
+        return RemoteSpec::Partial {
+            network: "mainnet".into(),
+            major,
+            minor,
+        };
     }
     RemoteSpec::Exact(normalize_install_tag(spec))
 }
@@ -1117,15 +1337,11 @@ pub fn parse_remote_spec(spec: &str) -> RemoteSpec {
 /// Resolve a version spec against a release list into a concrete tag.
 pub fn resolve_remote_spec(spec: &str, releases: &[serde_json::Value]) -> Result<String> {
     let parsed = parse_remote_spec(spec);
-    let tags = || {
-        releases
-            .iter()
-            .filter_map(|r| r["tag_name"].as_str())
-    };
+    let tags = || releases.iter().filter_map(|r| r["tag_name"].as_str());
     match parsed {
         RemoteSpec::Exact(tag) => Ok(tag),
         RemoteSpec::LatestForNetwork(net) => tags()
-            .filter(|t| network_label(t) == net)
+            .filter(|t| release_network(t) == Some(net.as_str()))
             .filter_map(|t| tag_semver(t).map(|v| (v, t)))
             .max_by_key(|(v, _)| *v)
             .map(|(_, t)| t.to_string())
@@ -1137,7 +1353,7 @@ pub fn resolve_remote_spec(spec: &str, releases: &[serde_json::Value]) -> Result
                 "svm remote-list".cyan()
             )),
         RemoteSpec::Partial { network, major, minor } => tags()
-            .filter(|t| network_label(t) == network)
+            .filter(|t| release_network(t) == Some(network.as_str()))
             .filter_map(|t| tag_semver(t).map(|v| (v, t)))
             .filter(|((maj, min, _), _)| *maj == major && *min == minor)
             .max_by_key(|(v, _)| *v)
@@ -1163,7 +1379,12 @@ pub fn asset_platform(os: &str, arch: &str) -> Result<(&'static str, &'static st
     let os_part = match os {
         "macos" => "macos",
         "linux" => "ubuntu",
-        other => return Err(anyhow!("Unsupported OS: {} (Sui publishes prebuilt binaries for macOS and Linux)", other)),
+        other => {
+            return Err(anyhow!(
+                "Unsupported OS: {} (Sui publishes prebuilt binaries for macOS and Linux)",
+                other
+            ));
+        }
     };
     let arch_part = match (os, arch) {
         (_, "x86_64") => "x86_64",
@@ -1187,7 +1408,7 @@ fn download_archive(
 ) -> Result<()> {
     // Status messages in the install pipeline go to stderr: the shim's
     // auto-install path may run while the caller's stdout is piped.
-    eprintln!("{} Downloading {}...", "⬇".blue(), label.cyan());
+    eprintln!("{} Downloading {}...", "info:".blue(), label.cyan());
 
     let response = client.get(url).send()?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -1228,27 +1449,29 @@ fn download_archive(
         pb
     };
 
-    // Stream to a partial file so an interrupted download is never
-    // mistaken for a complete cached archive.
-    let partial = dest.with_extension("partial");
+    // Each download gets a unique partial file, including concurrent installs
+    // of the same version. Drop removes it after any failed transfer.
+    let mut partial = tempfile::Builder::new()
+        .prefix(".download-")
+        .suffix(".partial")
+        .tempfile_in(
+            dest.parent()
+                .context("Archive destination has no parent directory")?,
+        )?;
     let result = (|| -> Result<u64> {
         let mut reader = pb.wrap_read(response);
-        let mut file = fs::File::create(&partial)?;
-        let bytes = std::io::copy(&mut reader, &mut file)?;
+        let bytes = std::io::copy(&mut reader, partial.as_file_mut())?;
         Ok(bytes)
     })();
     pb.finish_and_clear();
 
     match result {
         Ok(bytes) => {
-            fs::rename(&partial, dest)?;
+            partial.persist(dest)?;
             eprintln!("{} Downloaded {}.", "✔".green(), human_bytes(bytes));
             Ok(())
         }
-        Err(e) => {
-            let _ = fs::remove_file(&partial);
-            Err(e)
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -1274,9 +1497,13 @@ pub fn is_disk_full_error(err: &anyhow::Error) -> bool {
     })
 }
 
-fn open_archive(archive_path: &Path) -> Result<tar::Archive<flate2::read::GzDecoder<std::io::BufReader<fs::File>>>> {
+fn open_archive(
+    archive_path: &Path,
+) -> Result<tar::Archive<flate2::read::GzDecoder<std::io::BufReader<fs::File>>>> {
     let file = fs::File::open(archive_path)?;
-    Ok(tar::Archive::new(flate2::read::GzDecoder::new(std::io::BufReader::new(file))))
+    Ok(tar::Archive::new(flate2::read::GzDecoder::new(
+        std::io::BufReader::new(file),
+    )))
 }
 
 /// Extract only the shim-managed binaries into `staging`. Returns whether
@@ -1305,7 +1532,12 @@ fn unpack_managed_only(archive_path: &Path, staging: &Path) -> Result<bool> {
 ///
 /// Unless `full` is set, only the shim-managed binaries are extracted —
 /// release archives also carry sui-node, a multi-GiB sui-debug, etc.
-pub fn unpack_archive(archive_path: &Path, versions_dir: &Path, full_tag: &str, full: bool) -> Result<()> {
+pub fn unpack_archive(
+    archive_path: &Path,
+    versions_dir: &Path,
+    full_tag: &str,
+    full: bool,
+) -> Result<()> {
     let target_dir = versions_dir.join(full_tag);
     let staging = versions_dir.join(format!(".staging-{}-{}", full_tag, std::process::id()));
     if staging.exists() {
@@ -1374,7 +1606,18 @@ fn install_version(
     let bin_dir = svm_dir.join("bin");
     let target_dir = versions_dir.join(&full_tag);
     if target_dir.exists() {
-        eprintln!("{} Version {} is already installed.", "ℹ".blue(), full_tag.cyan());
+        if !target_dir.is_dir() {
+            return Err(anyhow!(
+                "Installation path '{}' is not a directory. Move or remove it, then retry 'svm install {}'.",
+                target_dir.display(),
+                full_tag
+            ));
+        }
+        eprintln!(
+            "{} Version {} is already installed.",
+            "info:".blue(),
+            full_tag.cyan()
+        );
         if full {
             eprintln!(
                 "  '--full' does not re-extract an existing install — run '{}' first, then reinstall (the archive stays cached).",
@@ -1389,7 +1632,8 @@ fn install_version(
 
     let (os_part, arch_part) = platform_parts()?;
     let asset_name = format!("sui-{}-{}-{}.tgz", full_tag, os_part, arch_part);
-    let url = format!("{}/{}/{}", download_base(), full_tag, asset_name);
+    let download_source = download_base();
+    let url = format!("{}/{}/{}", download_source, full_tag, asset_name);
 
     let client = build_client()?;
 
@@ -1407,7 +1651,9 @@ fn install_version(
             ));
         }
         ReleaseLookup::Found(assets) => {
-            let matching = assets.iter().find(|a| a["name"].as_str() == Some(asset_name.as_str()));
+            let matching = assets
+                .iter()
+                .find(|a| a["name"].as_str() == Some(asset_name.as_str()));
             match matching {
                 Some(asset) => asset_sha256(asset),
                 None => {
@@ -1422,7 +1668,11 @@ fn install_version(
                         full_tag.yellow(),
                         os_part,
                         arch_part,
-                        if available.is_empty() { "none".to_string() } else { available.join(", ") },
+                        if available.is_empty() {
+                            "none".to_string()
+                        } else {
+                            available.join(", ")
+                        },
                         "help:".blue().bold(),
                         "svm link".cyan()
                     ));
@@ -1432,18 +1682,30 @@ fn install_version(
         ReleaseLookup::Unavailable => {
             eprintln!(
                 "{} Could not query GitHub for release metadata — proceeding without checksum verification.",
-                "⚠".yellow()
+                "warning:".yellow()
             );
             None
         }
     };
 
     let cache = cache_dir(svm_dir)?;
-    let archive_path = cache.join(&asset_name);
+    // Official archives retain their existing cache names. Mirrors get a
+    // namespace derived from the complete URL: identical asset names from
+    // different sources must never share bytes, even without API digests.
+    let cache_name = if download_source == DOWNLOAD_BASE {
+        asset_name.clone()
+    } else {
+        format!("{:x}-{}", Sha256::digest(url.as_bytes()), asset_name)
+    };
+    let archive_path = cache.join(cache_name);
 
     let from_cache = archive_path.exists();
     if from_cache {
-        eprintln!("{} Using cached archive for {}...", "ℹ".blue(), full_tag.cyan());
+        eprintln!(
+            "{} Using cached archive for {}...",
+            "info:".blue(),
+            full_tag.cyan()
+        );
     } else {
         download_archive(&client, &url, &archive_path, &full_tag)?;
     }
@@ -1454,7 +1716,7 @@ fn install_version(
             // Stale or corrupted cache entry — replace it and try once more.
             eprintln!(
                 "{} Cached archive failed checksum verification — re-downloading.",
-                "⚠".yellow()
+                "warning:".yellow()
             );
             fs::remove_file(&archive_path)?;
             download_archive(&client, &url, &archive_path, &full_tag)?;
@@ -1492,7 +1754,7 @@ fn install_version(
     if !target_dir.join("sui").exists() {
         eprintln!(
             "{} The archive did not contain a 'sui' binary at its top level — the layout may have changed.",
-            "⚠".yellow()
+            "warning:".yellow()
         );
     }
 
@@ -1501,10 +1763,17 @@ fn install_version(
     } else if auto_activate {
         // auto_activate is false when a caller (e.g. `svm use`) activates itself
         if resolve_version(svm_dir)?.is_none() {
-            eprintln!("{} No version was active — activating {}.", "ℹ".blue(), full_tag.cyan());
+            eprintln!(
+                "{} No version was active — activating {}.",
+                "info:".blue(),
+                full_tag.cyan()
+            );
             use_version(&full_tag, versions_dir, &bin_dir, false)?;
         } else {
-            eprintln!("  Run '{}' to switch to it.", format!("svm use {}", full_tag).cyan());
+            eprintln!(
+                "  Run '{}' to switch to it.",
+                format!("svm use {}", full_tag).cyan()
+            );
         }
     }
 
@@ -1525,16 +1794,33 @@ pub fn release_network(tag: &str) -> Option<&'static str> {
 /// Returns Ok(None) when already up to date, Ok(Some(tag)) when a newer
 /// release exists, Err for non-release (linked/custom) versions.
 pub fn plan_update(current: &str, releases: &[serde_json::Value]) -> Result<Option<String>> {
-    let Some(net) = release_network(current) else {
-        return Err(anyhow!(
+    plan_update_for_pin(current, current, releases)
+}
+
+fn update_network(current: &str) -> Result<&'static str> {
+    release_network(current).ok_or_else(|| anyhow!(
             "{} The active version '{}' is a linked/custom build — '{}' only works with release versions.",
             "error:".red().bold(),
             current.yellow(),
             "svm update".cyan()
-        ));
-    };
+        ))
+}
 
-    let latest = resolve_remote_spec(net, releases)?;
+fn plan_update_for_pin(
+    current: &str,
+    pin: &str,
+    releases: &[serde_json::Value],
+) -> Result<Option<String>> {
+    let net = update_network(current)?;
+
+    // A moving series pin must stay within its major/minor series. Installing
+    // a newer minor release would leave that pin resolving to the old version.
+    let target_spec = if matches!(parse_remote_spec(pin), RemoteSpec::Partial { .. }) {
+        pin
+    } else {
+        net
+    };
+    let latest = resolve_remote_spec(target_spec, releases)?;
     if latest == current {
         return Ok(None);
     }
@@ -1547,12 +1833,14 @@ pub fn plan_update(current: &str, releases: &[serde_json::Value]) -> Result<Opti
 }
 
 fn update_version(versions_dir: &Path, svm_dir: &Path) -> Result<()> {
-    let (current_raw, source) = resolve_version(svm_dir)?.ok_or_else(|| anyhow!(
-        "{} No version is currently active.\n{} Run '{}' first.",
-        "error:".red().bold(),
-        "help:".blue().bold(),
-        "svm install latest".cyan()
-    ))?;
+    let (current_raw, source) = resolve_version(svm_dir)?.ok_or_else(|| {
+        anyhow!(
+            "{} No version is currently active.\n{} Run '{}' first.",
+            "error:".red().bold(),
+            "help:".blue().bold(),
+            "svm install latest".cyan()
+        )
+    })?;
 
     // A version file may hold a shorthand like "v1.63.4" or a series/channel
     // pin like "testnet" — resolve it to the installed directory name (or
@@ -1561,20 +1849,23 @@ fn update_version(versions_dir: &Path, svm_dir: &Path) -> Result<()> {
         .map(|(name, _)| name)
         .unwrap_or_else(|| normalize_install_tag(&current_raw));
 
+    // Linked/custom builds cannot be updated from releases. Reject them before
+    // network access so an offline connection cannot delay this diagnostic.
+    update_network(&current)?;
     let releases = fetch_releases_cached(svm_dir, 3)?;
-    let Some(latest) = plan_update(&current, &releases)? else {
+    let Some(latest) = plan_update_for_pin(&current, &current_raw, &releases)? else {
         println!(
-            "{} {} is already the latest {} release.",
+            "{} {} is already the latest release matching '{}'.",
             "✔".green(),
             current.green().bold(),
-            network_label(&current)
+            sanitize_display(&current_raw)
         );
         return Ok(());
     };
 
     println!(
         "{} Updating {} {} {}",
-        "➜".cyan(),
+        "info:".cyan(),
         current.yellow(),
         "→".dimmed(),
         latest.green().bold()
@@ -1636,14 +1927,14 @@ pub fn resolve_installed_version(version: &str, versions_dir: &Path) -> Option<(
         return None;
     }
     let raw_path = versions_dir.join(version);
-    if raw_path.exists() {
+    if raw_path.is_dir() {
         return Some((version.to_string(), raw_path));
     }
     // Fall back to normalized name if different from raw
     let normalized = normalize_install_tag(version);
     if normalized != version {
         let normalized_path = versions_dir.join(&normalized);
-        if normalized_path.exists() {
+        if normalized_path.is_dir() {
             return Some((normalized, normalized_path));
         }
     }
@@ -1657,12 +1948,17 @@ pub fn resolve_installed_version(version: &str, versions_dir: &Path) -> Option<(
 fn resolve_spec_against_installed(spec: &str, versions_dir: &Path) -> Option<(String, PathBuf)> {
     let (network, series) = match parse_remote_spec(spec) {
         RemoteSpec::LatestForNetwork(net) => (net, None),
-        RemoteSpec::Partial { network, major, minor } => (network, Some((major, minor))),
+        RemoteSpec::Partial {
+            network,
+            major,
+            minor,
+        } => (network, Some((major, minor))),
         RemoteSpec::Exact(_) => return None,
     };
     let (_, name) = fs::read_dir(versions_dir)
         .ok()?
         .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|name| release_network(name) == Some(network.as_str()))
         .filter_map(|name| tag_semver(&name).map(|v| (v, name)))
@@ -1681,27 +1977,47 @@ pub fn resolve_available_version(version: &str, versions_dir: &Path) -> Option<(
 }
 
 pub fn uninstall_version(version: &str, versions_dir: &Path, svm_dir: &Path) -> Result<()> {
-    let (resolved, target_dir) = resolve_installed_version(version, versions_dir)
-        .ok_or_else(|| anyhow!(
-            "{} Version '{}' is not installed.",
-            "error:".red().bold(),
-            version.yellow()
-        ))?;
+    let (resolved, target_dir) =
+        resolve_installed_version(version, versions_dir).ok_or_else(|| {
+            anyhow!(
+                "{} Version '{}' is not installed.",
+                "error:".red().bold(),
+                version.yellow()
+            )
+        })?;
+
+    // Resolve before removing anything: a linked name such as v1.0.0 takes
+    // precedence over mainnet-v1.0.0 and must not lose its global setting when
+    // the distinct normalized release is uninstalled.
+    let global_file = svm_dir.join("version");
+    let active = if global_file.exists() {
+        read_version_file(&global_file)?
+    } else {
+        None
+    };
+    let removing_active = active
+        .as_deref()
+        .and_then(|spec| resolve_available_version(spec, versions_dir))
+        .is_some_and(|(name, _)| name == resolved);
 
     fs::remove_dir_all(&target_dir)?;
-    println!("{} Successfully uninstalled {}.", "✔".green(), resolved.red().bold());
+    println!(
+        "{} Successfully uninstalled {}.",
+        "✔".green(),
+        resolved.red().bold()
+    );
 
     // If this was the globally active version, clear the global version file so
     // shims report a clear error instead of pointing at a missing directory.
-    let global_file = svm_dir.join("version");
-    if global_file.exists()
-        && let Some(active) = read_version_file(&global_file)?
-        && (active == resolved || normalize_install_tag(&active) == resolved)
+    if removing_active
+        && let Some(active) = active
+        && (matches!(parse_remote_spec(&active), RemoteSpec::Exact(_))
+            || resolve_available_version(&active, versions_dir).is_none())
     {
         fs::remove_file(&global_file)?;
         println!(
             "{} {} was the active version — run '{}' to pick another.",
-            "⚠".yellow(),
+            "warning:".yellow(),
             resolved.yellow(),
             "svm use <version>".cyan()
         );
@@ -1710,13 +2026,15 @@ pub fn uninstall_version(version: &str, versions_dir: &Path, svm_dir: &Path) -> 
 }
 
 fn warn_if_shims_not_on_path(bin_dir: &Path) {
-    let Ok(path_var) = std::env::var("PATH") else { return };
+    let Ok(path_var) = std::env::var("PATH") else {
+        return;
+    };
     if std::env::split_paths(&path_var).any(|p| p == bin_dir) {
         return;
     }
     eprintln!(
         "\n{} {} is not on your PATH — the '{}' command won't resolve to svm's shims.",
-        "⚠".yellow(),
+        "warning:".yellow(),
         bin_dir.display().to_string().blue(),
         "sui".cyan()
     );
@@ -1725,7 +2043,7 @@ fn warn_if_shims_not_on_path(bin_dir: &Path) {
 }
 
 fn use_version(version: &str, versions_dir: &Path, bin_dir: &Path, local: bool) -> Result<()> {
-    let resolved = match resolve_installed_version(version, versions_dir) {
+    let resolved = match resolve_available_version(version, versions_dir) {
         Some((resolved, _)) => resolved,
         None => {
             let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
@@ -1735,11 +2053,15 @@ fn use_version(version: &str, versions_dir: &Path, bin_dir: &Path, local: bool) 
                     version.cyan()
                 ))?
             {
-                let svm_dir = versions_dir.parent().context("versions dir has no parent")?;
+                let svm_dir = versions_dir
+                    .parent()
+                    .context("versions dir has no parent")?;
                 let tag = install_version(version, versions_dir, svm_dir, false, false, false)?;
                 resolve_installed_version(&tag, versions_dir)
                     .map(|(resolved, _)| resolved)
-                    .ok_or_else(|| anyhow!("Installed {} but could not locate it afterwards", tag))?
+                    .ok_or_else(|| {
+                        anyhow!("Installed {} but could not locate it afterwards", tag)
+                    })?
             } else {
                 return Err(anyhow!(
                     "{} Version '{}' not found.\n{} Run '{}' first.",
@@ -1752,10 +2074,17 @@ fn use_version(version: &str, versions_dir: &Path, bin_dir: &Path, local: bool) 
         }
     };
 
+    // Keep series/channel requests moving; exact requests keep their resolved
+    // directory name, including linked builds that resemble version tags.
+    let pin = if matches!(parse_remote_spec(version), RemoteSpec::Exact(_)) {
+        resolved.as_str()
+    } else {
+        version
+    };
     if local {
         let cwd = std::env::current_dir()?;
         let version_file = cwd.join(".svm-version");
-        fs::write(&version_file, format!("{}\n", resolved))?;
+        fs::write(&version_file, format!("{}\n", pin))?;
         println!(
             "{} Set local version to {} in {}",
             "✔".green(),
@@ -1763,9 +2092,15 @@ fn use_version(version: &str, versions_dir: &Path, bin_dir: &Path, local: bool) 
             version_file.display().to_string().dimmed()
         );
     } else {
-        let svm_dir = versions_dir.parent().context("versions dir has no parent")?;
-        fs::write(svm_dir.join("version"), format!("{}\n", resolved))?;
-        println!("{} Active version set to: {}", "✨".green(), resolved.green().bold());
+        let svm_dir = versions_dir
+            .parent()
+            .context("versions dir has no parent")?;
+        fs::write(svm_dir.join("version"), format!("{}\n", pin))?;
+        println!(
+            "{} Active version set to: {}",
+            "✔".green(),
+            resolved.green().bold()
+        );
     }
 
     let current_exe = std::env::current_exe()?;
@@ -1812,7 +2147,9 @@ fn link_local(name: &str, path: Option<&Path>, versions_dir: &Path) -> Result<()
         && release_network(name).is_some()
         && !target_dir.join(LINK_MARKER).exists()
     {
-        let is_legacy_link = SVM_BINARIES.iter().any(|bin| target_dir.join(bin).is_symlink());
+        let is_legacy_link = SVM_BINARIES
+            .iter()
+            .any(|bin| target_dir.join(bin).is_symlink());
         if !is_legacy_link {
             return Err(anyhow!(
                 "{} '{}' is an installed release, not a linked build.\n{} Pick a different name, or run '{}' first.",
@@ -1838,7 +2175,9 @@ fn link_local(name: &str, path: Option<&Path>, versions_dir: &Path) -> Result<()
     // sources against the canonicalized target too — the sources are
     // canonicalized, and a symlinked $HOME component would otherwise let a
     // source inside the target slip past and be wiped below.
-    let target_guard = target_dir.canonicalize().unwrap_or_else(|_| target_dir.clone());
+    let target_guard = target_dir
+        .canonicalize()
+        .unwrap_or_else(|_| target_dir.clone());
     let mut found: Vec<(&str, PathBuf)> = Vec::new();
     for bin in SVM_BINARIES {
         if let Some(src) = search_dirs.iter().map(|d| d.join(bin)).find(|p| p.exists()) {
@@ -1903,10 +2242,8 @@ fn link_local(name: &str, path: Option<&Path>, versions_dir: &Path) -> Result<()
 
     for (bin, src) in &found {
         println!(
-            "  {} Copied {} {} {}",
-            "↳".dimmed(),
+            "  Copied {} from {}",
             bin.cyan(),
-            "←".dimmed(),
             src.display().to_string().dimmed()
         );
     }
@@ -1943,14 +2280,15 @@ fn list_local(versions_dir: &Path, svm_dir: &Path) -> Result<()> {
 
     let mut names: Vec<String> = fs::read_dir(versions_dir)?
         .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| !n.starts_with('.'))
+        .filter(|n| valid_version_name(n))
         .collect();
 
     if names.is_empty() {
         println!(
             "{} No versions installed. Run '{}' to get started.",
-            "ℹ".blue(),
+            "info:".blue(),
             "svm install latest".cyan()
         );
         return Ok(());
@@ -1967,8 +2305,11 @@ fn list_local(versions_dir: &Path, svm_dir: &Path) -> Result<()> {
         // recorded source from their .svm-link marker.
         let link_note = fs::read_link(version_dir.join("sui"))
             .ok()
-            .map(|t| format!(" ↪ {}", t.display()))
-            .or_else(|| link_source(&version_dir).map(|src| format!(" ↪ {} (copy)", src)))
+            .map(|t| format!("  from {}", sanitize_display(&t.display().to_string())))
+            .or_else(|| {
+                link_source(&version_dir)
+                    .map(|src| format!("  from {} (copy)", sanitize_display(&src)))
+            })
             .unwrap_or_default();
 
         if active.as_deref() == Some(name.as_str()) {
@@ -2008,8 +2349,16 @@ fn cache_command(svm_dir: &Path, action: Option<CacheAction>) -> Result<()> {
         None => {
             let archives = archive_entries()?;
             let total: u64 = archives.iter().map(|(_, size)| size).sum();
-            println!("{} Cache directory: {}", "➜".cyan(), cache.display().to_string().blue());
-            println!("  Release archives: {} ({})", archives.len(), human_bytes(total));
+            println!(
+                "{} Cache directory: {}",
+                "info:".cyan(),
+                cache.display().to_string().blue()
+            );
+            println!(
+                "  Release archives: {} ({})",
+                archives.len(),
+                human_bytes(total)
+            );
             let releases_file = cache.join("releases.json");
             if let Ok(meta) = fs::metadata(&releases_file) {
                 println!("  Release list cache: {}", human_bytes(meta.len()));
@@ -2039,7 +2388,11 @@ fn cache_command(svm_dir: &Path, action: Option<CacheAction>) -> Result<()> {
                     let name = entry.file_name().to_string_lossy().into_owned();
                     if name.starts_with(".staging-") {
                         fs::remove_dir_all(entry.path())?;
-                        println!("{} Removed leftover staging directory {}.", "✔".green(), name.dimmed());
+                        println!(
+                            "{} Removed leftover staging directory {}.",
+                            "✔".green(),
+                            name.dimmed()
+                        );
                     }
                 }
             }
@@ -2058,7 +2411,7 @@ fn cache_command(svm_dir: &Path, action: Option<CacheAction>) -> Result<()> {
                     human_bytes(freed)
                 );
             } else {
-                println!("{} No archives to remove.", "ℹ".blue());
+                println!("{} No archives to remove.", "info:".blue());
             }
         }
     }
@@ -2071,50 +2424,112 @@ fn print_completions(shell: Shell) {
     print!("{}", completion_script(shell));
 }
 
-/// Render the completion script for a shell. Zsh gets dynamic version
-/// completion wired in; other shells use the stock clap output.
+/// Render shell completions. Dynamic candidates are always local: installed
+/// directories and cached release tags. Pressing Tab must never wait on GitHub.
 pub fn completion_script(shell: Shell) -> String {
     let mut cmd = Cli::command();
-    let bin_name = "svm";
-
     let mut buffer = Vec::new();
-    generate(shell, &mut cmd, bin_name, &mut buffer);
+    generate(shell, &mut cmd, "svm", &mut buffer);
     let script = String::from_utf8_lossy(&buffer).into_owned();
 
-    if shell != Shell::Zsh {
-        return script;
-    }
-
-    let custom_funcs = r#"
+    match shell {
+        Shell::Zsh => {
+            let helpers = r#"
 _svm_local_versions() {
+    setopt localoptions no_glob_dots
     local -a versions
-    versions=($(command ls -1 $HOME/.svm/versions 2>/dev/null | grep -v '^\.'))
-    _describe 'installed versions' versions
+    versions=("$HOME"/.svm/versions/*(N/:t))
+    compadd -X 'installed versions' -a versions
 }
 _svm_remote_versions() {
     local -a versions
-    versions=($(svm remote-list --tags-only --cached 2>/dev/null))
-    if [[ ${#versions[@]} -eq 0 ]]; then
-        versions=($(svm remote-list --tags-only 2>/dev/null))
-    fi
-    _describe 'available versions' versions
+    versions=(latest mainnet testnet devnet)
+    versions+=("${(@f)$(command svm remote-list --tags-only --cached 2>/dev/null)}")
+    versions=("${(@u)versions:#}")
+    compadd -X 'available versions (cached)' -a versions
 }
 "#;
-
-    let mut final_script =
-        script.replace("#compdef svm", &format!("#compdef svm\n{}", custom_funcs));
-
-    // install should complete with remote versions
-    final_script = final_script.replacen("':version:_default'", "':version:_svm_remote_versions'", 1);
-    // use, uninstall, and exec should complete with local versions
-    final_script = final_script.replace("':version:_default'", "':version:_svm_local_versions'");
-    // link name gets no special completion (user picks the name)
-    final_script = final_script.replace("':name:_default'", "':name:'");
-    // which completes the managed binary names
-    final_script = final_script.replace(
-        "'::binary:_default'",
-        &format!("'::binary:({})'", SVM_BINARIES.join(" ")),
-    );
-
-    final_script
+            let script = script.replace("#compdef svm", &format!("#compdef svm\n{helpers}"));
+            let script =
+                script.replacen("':version:_default'", "':version:_svm_remote_versions'", 1);
+            let script = script.replace("':version:_default'", "':version:_svm_local_versions'");
+            let script = script.replace("':name:_default'", "':name:'");
+            script.replace("'::binary:_default'", "'::binary:(sui move-analyzer)'")
+        }
+        Shell::Bash => format!("{script}\n{BASH_DYNAMIC_COMPLETIONS}"),
+        Shell::Fish => format!("{script}\n{FISH_DYNAMIC_COMPLETIONS}"),
+        _ => script,
+    }
 }
+
+const BASH_DYNAMIC_COMPLETIONS: &str = r#"
+# Keep clap's option/subcommand completion and add versions at their argument.
+_svm_dynamic() {
+    local cur="${COMP_WORDS[COMP_CWORD]}" sub="${COMP_WORDS[1]}" i item path
+    if [[ $COMP_CWORD -lt 2 || $cur == -* ]]; then
+        _svm "$@"
+        return
+    fi
+    case "$sub" in
+        install|use|uninstall|exec|which) ;;
+        *) _svm "$@"; return ;;
+    esac
+    # These commands' options take no values. Once a positional argument has
+    # been supplied, leave subsequent arguments to clap (especially exec).
+    for ((i=2; i<COMP_CWORD; i++)); do
+        if [[ ${COMP_WORDS[i]} != -* ]]; then
+            _svm "$@"
+            return
+        fi
+    done
+    COMPREPLY=()
+    if [[ $sub == install ]]; then
+        while IFS= read -r item; do
+            [[ -n $item && $item == "$cur"* ]] && COMPREPLY+=("$item")
+        done < <(printf '%s\n' latest mainnet testnet devnet; command svm remote-list --tags-only --cached 2>/dev/null)
+    elif [[ $sub == which ]]; then
+        for item in sui move-analyzer; do
+            [[ $item == "$cur"* ]] && COMPREPLY+=("$item")
+        done
+    else
+        for path in "$HOME"/.svm/versions/*; do
+            [[ -d $path ]] || continue
+            item=${path##*/}
+            [[ $item != .* ]] || continue
+            [[ $item == "$cur"* ]] && COMPREPLY+=("$item")
+        done
+    fi
+}
+if [[ ${BASH_VERSINFO[0]} -gt 4 || ( ${BASH_VERSINFO[0]} -eq 4 && ${BASH_VERSINFO[1]} -ge 4 ) ]]; then
+    complete -F _svm_dynamic -o nosort -o filenames svm
+else
+    complete -F _svm_dynamic -o filenames svm
+fi
+"#;
+
+const FISH_DYNAMIC_COMPLETIONS: &str = r#"
+function __svm_local_versions
+    for path in "$HOME"/.svm/versions/*
+        if test -d "$path"
+            string replace -r '^.*/' '' -- "$path"
+        end
+    end
+end
+function __svm_remote_versions
+    printf '%s\n' latest mainnet testnet devnet
+    command svm remote-list --tags-only --cached 2>/dev/null
+end
+function __svm_needs_version
+    set -l args (commandline -opc)
+    set -e args[1..2]
+    for arg in $args
+        if not string match -q -- '-*' "$arg"
+            return 1
+        end
+    end
+    return 0
+end
+complete -c svm -n '__fish_svm_using_subcommand install; and __svm_needs_version' -f -a '(__svm_remote_versions)'
+complete -c svm -n '__fish_svm_using_subcommand use uninstall exec; and __svm_needs_version' -f -a '(__svm_local_versions)'
+complete -c svm -n '__fish_svm_using_subcommand which; and __svm_needs_version' -f -a 'sui move-analyzer'
+"#;
